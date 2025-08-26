@@ -6,6 +6,13 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import router from './routes.js';
 import './db.js';
+import app from './app.js';
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`[API] listening on http://localhost:${PORT}`);
+});
+
 
 dotenv.config();
 const app = express();
