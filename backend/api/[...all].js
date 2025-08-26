@@ -1,10 +1,4 @@
-// backend/api/[...all].js
-import app from '../src/app.js';
-
+import server from '../src/app.js';
 export default function handler(req, res) {
-  // teruskan semua request /api/** ke Express
-  return app(req, res);
+  return server(req, res);
 }
-
-// (opsional) kalau mau batasi durasi:
-// export const config = { maxDuration: 10 };

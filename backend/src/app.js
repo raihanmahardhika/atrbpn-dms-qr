@@ -2,22 +2,22 @@ import express from 'express';
 import cors from 'cors';
 import router from './routes.js';
 
-const app = express();
+const appExpress = express();
 
 const allow = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map(s => s.trim())
   : true;
 
-app.use(cors({
+appExpress.use(cors({
   origin: allow,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type','Authorization'],
 }));
-app.options('*', cors({ origin: allow })); // tanggapi preflight OPTIONS
+appExpress.options('*', cors({ origin: allow })); // preflight
 
-app.use(express.json({ limit: '2mb' }));
+appExpress.use(express.json({ limit: '2mb' }));
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
-app.use('/api', router);
+appExpress.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+appExpress.use('/api', router);
 
-export default app;
+export default appExpress;
