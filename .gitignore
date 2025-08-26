@@ -1,0 +1,19 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn.lock
+package-lock.json
+
+# Build outputs
+frontend/dist/
+*.log
+
+# Env files (jangan push rahasia)
+.env
+.env.*
+!.env.example
+
+# Editor/system
+.vscode/
+.DS_Store
+

@@ -1,0 +1,284 @@
+import express from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import { query } from './db.js';
+import { generateQR } from './qrcode.js';
+import { splitGapWaitingResting } from './utils.js';
+
+const router = express.Router();
+
+async function getActivities(processId) {
+  const r = await query(`
+    SELECT id,name,order_no,is_decision,
+           decision_accept_label, decision_reject_label,
+           next_on_accept, next_on_reject
+    FROM process_activities
+    WHERE process_id=$1
+    ORDER BY order_no ASC
+  `,[processId]);
+  return r.rows;
+}
+async function getLastCompletedScan(documentId) {
+  const r = await query(`
+    SELECT s.*, pa.name, pa.order_no, pa.is_decision, pa.process_id,
+           pa.decision_accept_label, pa.decision_reject_label,
+           pa.next_on_accept, pa.next_on_reject
+    FROM activity_scans s
+    LEFT JOIN process_activities pa ON pa.id=s.process_activity_id
+    WHERE s.document_id=$1 AND s.end_time IS NOT NULL
+    ORDER BY s.end_time DESC LIMIT 1
+  `, [documentId]);
+  return r.rowCount ? r.rows[0] : null;
+}
+async function getOpenScan(documentId) {
+  const r = await query(`
+    SELECT s.*, pa.name, pa.order_no, pa.is_decision, pa.process_id,
+           pa.decision_accept_label, pa.decision_reject_label,
+           pa.next_on_accept, pa.next_on_reject
+    FROM activity_scans s
+    LEFT JOIN process_activities pa ON pa.id=s.process_activity_id
+    WHERE s.document_id=$1 AND s.end_time IS NULL
+    ORDER BY s.start_time DESC LIMIT 1
+  `,[documentId]);
+  return r.rowCount ? r.rows[0] : null;
+}
+async function computeNextExpected(document) {
+  if (document.status === 'DONE') return { status: 'COMPLETED' };
+  const open = await getOpenScan(document.id);
+  if (open) return { status:'IN_PROGRESS', current: open };
+  const last = await getLastCompletedScan(document.id);
+  const acts = document.process_id ? await getActivities(document.process_id) : [];
+  let nextAct = null;
+  if (!last) nextAct = acts[0] || null;
+  else if (last.next_activity_id) nextAct = acts.find(a => a.id === last.next_activity_id) || null;
+  else {
+    const idx = acts.findIndex(a => a.id === last.process_activity_id);
+    nextAct = idx >= 0 && idx + 1 < acts.length ? acts[idx+1] : null;
+  }
+  if (!nextAct && last) return { status: 'COMPLETED', last, activities: acts };
+  return { status: 'READY', next: nextAct, activities: acts, last };
+}
+
+router.get('/health', (_,res) => res.json({ok:true,time:new Date().toISOString()}));
+
+router.post('/auth/admin/login', async (req,res) => {
+  try {
+    const { adminId } = req.body;
+    if (!adminId) return res.status(400).json({error:'adminId is required'});
+    const r = await query('SELECT admin_id,name,office_type,region FROM admins WHERE admin_id=$1',[adminId]);
+    if (r.rowCount === 0) return res.status(404).json({error:'Admin ID not found'});
+    res.json(r.rows[0]);
+  } catch(e){ console.error(e); res.status(500).json({error:'Login failed'}); }
+});
+
+router.get('/admin/processes', async (req,res)=>{
+  const r = await query('SELECT id, code, name FROM processes ORDER BY name ASC');
+  res.json(r.rows);
+});
+
+router.post('/admin/documents', async (req,res)=>{
+  try{
+    const { adminId, docType, processId } = req.body;
+    if (!adminId) return res.status(400).json({error:'adminId is required'});
+    const a = await query('SELECT office_type,region FROM admins WHERE admin_id=$1',[adminId]);
+    if (a.rowCount === 0) return res.status(400).json({error:'Admin not found'});
+    const { office_type, region } = a.rows[0];
+
+    let pid = processId;
+    if (!pid && docType) {
+      const p = await query('SELECT id FROM processes WHERE name=$1 OR code=$1',[docType]);
+      if (p.rowCount) pid = p.rows[0].id;
+    }
+    if (!pid) return res.status(400).json({error:'processId/docType is required'});
+
+    const id = uuidv4();
+    await query('INSERT INTO documents (id,process_id,doc_type,office_type,region) VALUES ($1,$2,$3,$4,$5)',
+      [id, pid, docType || '', office_type, region]);
+
+    res.json({ id, docType, processId: pid, officeType: office_type, region, qrDownloadUrl:`/admin/documents/${id}/qr.png` });
+  } catch(e){ console.error(e); res.status(500).json({error:'Failed to create document'}); }
+});
+
+router.get('/admin/documents/:id/qr.png', async (req,res)=>{
+  const d = await query('SELECT id FROM documents WHERE id=$1',[req.params.id]);
+  if (d.rowCount === 0) return res.status(404).send('Not Found');
+  const png = await generateQR(JSON.stringify({ documentId: req.params.id }));
+  res.setHeader('Content-Type','image/png');
+  res.send(png);
+});
+
+router.get('/scan/state/:documentId', async (req,res)=>{
+  try{
+    const docq = await query('SELECT * FROM documents WHERE id=$1',[req.params.documentId]);
+    if (docq.rowCount === 0) return res.status(404).json({error:'Document not found'});
+    const doc = docq.rows[0];
+    const state = await computeNextExpected(doc);
+
+    let waitingNow = 0, restingNow = 0;
+    if (state.status === 'READY') {
+      if (state.last) {
+        const parts = splitGapWaitingResting(new Date(state.last.end_time), new Date());
+        waitingNow = parts.waitingSeconds; restingNow = parts.restingSeconds;
+      } else if (doc.created_at) {
+        const parts = splitGapWaitingResting(new Date(doc.created_at), new Date());
+        waitingNow = parts.waitingSeconds; restingNow = parts.restingSeconds;
+      }
+    }
+    res.json({ document: doc, state, waitingNow, restingNow, activities: doc.process_id ? await getActivities(doc.process_id) : [] });
+  } catch(e){ console.error(e); res.status(500).json({error:'Failed to get state'}); }
+});
+
+router.post('/scan/start', async (req,res)=>{
+  try{
+    const { documentId, processActivityId } = req.body;
+    if (!documentId) return res.status(400).json({error:'documentId is required'});
+    const dq = await query('SELECT * FROM documents WHERE id=$1',[documentId]);
+    if (dq.rowCount === 0) return res.status(404).json({error:'Document not found'});
+    const doc = dq.rows[0];
+
+    if (doc.status === 'DONE') return res.status(400).json({error:'Proses sudah selesai'});
+
+    const count = await query('SELECT COUNT(*)::int c FROM activity_scans WHERE document_id=$1',[documentId]);
+    if (count.rows[0].c === 0) {
+      if (doc.status === 'OPEN') {
+        const nowIso = new Date().toISOString();
+        await query('UPDATE documents SET created_at=$1, status=$2 WHERE id=$3',[nowIso,'WAITING', documentId]);
+        return res.json({ initialized: true, status: 'WAITING' });
+      }
+    }
+
+    const open = await getOpenScan(documentId);
+    if (open) return res.status(400).json({error:`Masih ada aktivitas berjalan: ${open.activity_name}`});
+
+    const comp = await computeNextExpected(doc);
+    if (comp.status === 'COMPLETED') return res.status(400).json({error:'Proses sudah selesai'});
+    const expected = comp.next ? comp.next.id : null;
+    if (!expected && !processActivityId) return res.status(400).json({error:'Tidak ada aktivitas berikutnya'});
+    if (doc.process_id && expected && processActivityId && processActivityId !== expected) {
+      return res.status(400).json({error:'Aktivitas tidak sesuai urutan proses'});
+    }
+    const useActId = processActivityId || expected;
+    let activityName = 'Aktivitas';
+    if (useActId) {
+      const a = await query('SELECT name FROM process_activities WHERE id=$1',[useActId]);
+      activityName = a.rowCount ? a.rows[0].name : activityName;
+    }
+
+    const last = comp.last;
+    const lastEnd = last?.end_time || doc.created_at;
+    const parts = splitGapWaitingResting(new Date(lastEnd), new Date());
+
+    const id = uuidv4();
+    const ins = await query(
+      'INSERT INTO activity_scans (id,document_id,process_activity_id,activity_name,waiting_seconds,resting_seconds) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,start_time',
+      [id, documentId, useActId, activityName, parts.waitingSeconds, parts.restingSeconds]
+    );
+    res.json({ activityId: ins.rows[0].id, startTime: ins.rows[0].start_time, waitingSeconds: parts.waitingSeconds, restingSeconds: parts.restingSeconds });
+  } catch(e){ console.error(e); res.status(500).json({error:'Failed to start activity'}); }
+});
+
+router.post('/scan/finish', async (req,res)=>{
+  try{
+    const { activityId, documentId, nextProcessActivityId, decision } = req.body;
+    let t;
+    if (activityId) {
+      t = await query(`
+        SELECT s.*, pa.is_decision, pa.next_on_accept, pa.next_on_reject, pa.process_id, pa.order_no
+        FROM activity_scans s
+        LEFT JOIN process_activities pa ON pa.id=s.process_activity_id
+        WHERE s.id=$1`,[activityId]);
+    } else if (documentId) {
+      t = await query(`
+        SELECT s.*, pa.is_decision, pa.next_on_accept, pa.next_on_reject, pa.process_id, pa.order_no
+        FROM activity_scans s
+        LEFT JOIN process_activities pa ON pa.id=s.process_activity_id
+        WHERE s.document_id=$1 AND s.end_time IS NULL
+        ORDER BY s.start_time DESC LIMIT 1`,[documentId]);
+    } else {
+      return res.status(400).json({error:'Provide activityId or documentId'});
+    }
+    if (t.rowCount === 0) return res.status(404).json({error:'Open activity not found'});
+    const row = t.rows[0];
+    const end = new Date();
+    const duration = Math.round((end - new Date(row.start_time))/1000);
+
+    let setDone = false;
+    if (row.is_decision) {
+      // ✅ pakai operator JS yang benar
+      let mappedNext = null;
+      if (decision === 'accept' && row.next_on_accept) mappedNext = row.next_on_accept;
+      if (decision === 'reject' && row.next_on_reject) mappedNext = row.next_on_reject;
+
+      const finalNext = nextProcessActivityId || mappedNext; // ✅ pakai ||
+      await query(
+        'UPDATE activity_scans SET end_time=$1, duration_seconds=$2, next_activity_id=$3 WHERE id=$4',
+        [end.toISOString(), duration, finalNext || null, row.id] // ✅ null di JS/PG
+      );
+      if (!finalNext) setDone = true; // tidak ada langkah lanjut → selesai
+    } else {
+      await query(
+        'UPDATE activity_scans SET end_time=$1, duration_seconds=$2 WHERE id=$3',
+        [end.toISOString(), duration, row.id]
+      );
+      // cek apakah ini aktivitas terakhir di proses
+      const cnt = await query(
+        'SELECT COUNT(*)::int c FROM process_activities WHERE process_id=$1 AND order_no > $2',
+        [row.process_id, row.order_no]
+      );
+      if (cnt.rows[0].c === 0) setDone = true;
+    }
+
+    if (setDone) {
+      await query('UPDATE documents SET status=$1 WHERE id=$2', ['DONE', row.document_id]);
+    }
+
+    res.json({ activityId: row.id, endTime: end.toISOString(), durationSeconds: duration, done: setDone });
+  } catch(e){
+    console.error(e);
+    res.status(500).json({error:'Failed to finish activity'});
+  }
+});
+
+router.get('/admin/documents/:id', async (req,res)=>{
+  const doc = await query('SELECT d.*, p.name as process_name, p.code as process_code FROM documents d LEFT JOIN processes p ON p.id=d.process_id WHERE d.id=$1',[req.params.id]);
+  if (doc.rowCount === 0) return res.status(404).json({error:'Document not found'});
+  const scans = await query(`
+    SELECT s.*, pa.name AS master_activity_name, pa.order_no, pa.is_decision
+    FROM activity_scans s
+    LEFT JOIN process_activities pa ON pa.id=s.process_activity_id
+    WHERE s.document_id=$1
+    ORDER BY s.start_time ASC`,[req.params.id]);
+
+  let overallSeconds = null;
+  if (scans.rowCount > 0) {
+    const firstStart = new Date(doc.rows[0].created_at);
+    const lastEnd = scans.rows.filter(s=>s.end_time).slice(-1)[0]?.end_time;
+    if (firstStart && lastEnd) overallSeconds = Math.round((new Date(lastEnd)-firstStart)/1000);
+  }
+
+  let totalExec = 0, totalWait = 0, totalRest = 0;
+  for (const s of scans.rows) {
+    totalExec += s.duration_seconds || 0;
+    totalWait += s.waiting_seconds || 0;
+    totalRest += s.resting_seconds || 0;
+  }
+
+  res.json({ document: doc.rows[0], scans: scans.rows, overallSeconds, totalExecutionSeconds: totalExec, totalWaitingSeconds: totalWait, totalRestingSeconds: totalRest });
+});
+
+router.get('/admin/reports/summary', async (req,res)=>{
+  const rows = await query(`
+    SELECT d.id,d.doc_type,d.office_type,d.region,d.status,p.name as process_name,
+           SUM(COALESCE(s.duration_seconds,0)) AS total_activity_seconds,
+           SUM(COALESCE(s.waiting_seconds,0)) AS total_waiting_seconds,
+           SUM(COALESCE(s.resting_seconds,0)) AS total_resting_seconds
+    FROM documents d
+    LEFT JOIN processes p ON p.id=d.process_id
+    LEFT JOIN activity_scans s ON s.document_id=d.id
+    GROUP BY d.id, p.name
+    ORDER BY d.created_at DESC
+    LIMIT 200
+  `);
+  res.json(rows.rows);
+});
+
+export default router;

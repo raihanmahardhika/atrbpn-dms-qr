@@ -1,0 +1,1 @@
+import QRCode from 'qrcode'; export async function generateQR(c){ return await QRCode.toBuffer(c,{errorCorrectionLevel:'M',type:'png',margin:2,scale:8}); }
