@@ -1,19 +1,23 @@
-// backend/src/app.js
 import express from 'express';
 import cors from 'cors';
 import router from './routes.js';
 
 const app = express();
 
-// CORS: izinkan domain Firebase kamu
 const allow = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map(s => s.trim())
   : true;
 
-app.use(cors({ origin: allow }));
+app.use(cors({
+  origin: allow,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.options('*', cors({ origin: allow })); // tanggapi preflight OPTIONS
+
 app.use(express.json({ limit: '2mb' }));
 
-// semua route lama tetap di bawah /api
+app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.use('/api', router);
 
 export default app;
