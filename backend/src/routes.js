@@ -1,7 +1,7 @@
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from './db.js';
-import { generateQR } from './qrcode.js';
+import QRCode from 'qrcode'
 import { splitGapWaitingResting } from './utils.js';
 
 const router = express.Router();
@@ -98,12 +98,28 @@ router.post('/admin/documents', async (req,res)=>{
   } catch(e){ console.error(e); res.status(500).json({error:'Failed to create document'}); }
 });
 
-router.get('/admin/documents/:id/qr.png', async (req,res)=>{
-  const d = await query('SELECT id FROM documents WHERE id=$1',[req.params.id]);
-  if (d.rowCount === 0) return res.status(404).send('Not Found');
-  const png = await generateQR(JSON.stringify({ documentId: req.params.id }));
-  res.setHeader('Content-Type','image/png');
-  res.send(png);
+router.get('/admin/documents/:id/qr.png', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // (opsional) kalau ingin validasi id di DB, buka komentar ini:
+    // const doc = await query('select id from documents where id = $1', [id]);
+    // if (doc.rowCount === 0) return res.status(404).send('document not found');
+
+    const png = await QRCode.toBuffer(id, {
+      type: 'png',
+      margin: 1,
+      width: 512,
+      errorCorrectionLevel: 'M',
+    });
+
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).send(png);
+  } catch (err) {
+    console.error('[qr.png] error', err);
+    return res.status(500).send('failed to generate qr');
+  }
 });
 
 router.get('/scan/state/:documentId', async (req,res)=>{

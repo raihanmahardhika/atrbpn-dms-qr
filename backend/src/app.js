@@ -47,6 +47,9 @@ appExpress.use(cors({
 
 appExpress.use(express.json({ limit: '2mb' }));
 
+// reply empty for favicon requests
+appExpress.get('/favicon.ico', (req, res) => res.status(204).end());
+
 // (optional) tiny logger to see what hits the app in Vercel logs
 appExpress.use((req, _res, next) => {
   console.log('[API]', req.method, req.url);
