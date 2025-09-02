@@ -1,12 +1,14 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './app.css';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 
-/* ========== API helpers ========== */
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000/api';
+/* ============== API helpers ============== */
+const API =
+  import.meta.env.VITE_API_BASE_URL ||
+  'http://localhost:4000/api';
 
 async function apiGet(path) {
-  const r = await fetch(`${API}${path}`);
+  const r = await fetch(`${API}${path}`, { credentials: 'omit' });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -14,6 +16,7 @@ async function apiPost(path, body) {
   const r = await fetch(`${API}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'omit',
     body: JSON.stringify(body ?? {}),
   });
   const d = await r.json().catch(() => ({}));
@@ -21,85 +24,97 @@ async function apiPost(path, body) {
   return d;
 }
 
-/* ========== Small UI ========== */
-function Loading({ show }) {
-  if (!show) return null;
-  return (
-    <div style={{
-      position: 'fixed', inset: 0, background: 'rgba(0,0,0,.35)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999
-    }}>
-      <div style={{
-        width: 64, height: 64, borderRadius: '50%',
-        border: '6px solid #fff', borderTopColor: 'transparent',
-        animation: 'spin 0.9s linear infinite'
-      }} />
-      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-    </div>
-  );
-}
-
-function Header({ title, onBack, right }) {
+/* ============== UI atoms ============== */
+function Header({ title, right, onBack }) {
   return (
     <header>
       <div className="container" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        {onBack ? (
-          <button
-            className="secondary"
-            style={{ width: 'auto', padding: '6px 10px' }}
-            onClick={onBack}
-          >← Back</button>
-        ) : null}
-        <h1 style={{ marginLeft: onBack ? 8 : 0 }}>{title}</h1>
+        {onBack && (
+          <button className="secondary" onClick={onBack} style={{ marginRight: 12 }}>
+            ← Back
+          </button>
+        )}
+        <h1 style={{ margin: 0 }}>{title}</h1>
         <div style={{ marginLeft: 'auto' }}>{right}</div>
       </div>
     </header>
   );
 }
 
-/* ========== Home ========== */
+function Loading({ show }) {
+  if (!show) return null;
+  return (
+    <div className="loading-overlay">
+      <div className="spinner" />
+    </div>
+  );
+}
+
+/* ============== QR scanner ============== */
+function QRScanner({ onScan }) {
+  const idRef = useRef(`qr-reader-${Math.random().toString(36).slice(2)}`);
+
+  useEffect(() => {
+    const scanner = new Html5QrcodeScanner(idRef.current, { fps: 10, qrbox: 300 }, false);
+    scanner.render(
+      (text) => {
+        try {
+          onScan(text);
+        } catch (e) {
+          console.error(e);
+        }
+      },
+      (err) => {
+        // abaikan noise
+      }
+    );
+    return () => {
+      try {
+        scanner.clear();
+      } catch {}
+    };
+  }, [onScan]);
+
+  return <div id={idRef.current} style={{ width: '100%' }} />;
+}
+
+/* ============== Main menu ============== */
 function MainMenu({ goto }) {
   return (
     <div>
       <Header
         title="ATR BPN · Document Management System Barcode"
         right={
-          <button
-            className="secondary"
-            style={{ width: 'auto', padding: '6px 10px' }}
-            onClick={() => goto('adminSignIn')}
-          >
+          <button className="secondary small" onClick={() => goto('adminSignIn')}>
             Sign In Admin
           </button>
         }
       />
       <div className="container">
         <div className="card center">
-          <button className="big-btn secondary" onClick={() => goto('guest')}>Scan QR</button>
+          <button className="big-btn" onClick={() => goto('guest')}>
+            Scan QR
+          </button>
         </div>
       </div>
     </div>
   );
 }
 
-/* ========== Admin ========== */
+/* ============== Admin ============== */
 function AdminSignIn({ onSignedIn, onBack }) {
   const [adminId, setAdminId] = useState('');
   const [err, setErr] = useState('');
-  const [loading, setLoading] = useState(false);
 
   async function submit(e) {
     e.preventDefault();
     setErr('');
-    setLoading(true);
     try {
       const admin = await apiPost('/auth/admin/login', { adminId });
       localStorage.setItem('dms_admin', JSON.stringify(admin));
       onSignedIn(admin);
     } catch (e) {
       setErr(e.message || 'Login failed');
-    } finally {
-      setLoading(false);
     }
   }
 
@@ -110,13 +125,12 @@ function AdminSignIn({ onSignedIn, onBack }) {
         <div className="card">
           <form onSubmit={submit}>
             <label>Admin ID</label>
-            <input value={adminId} onChange={e => setAdminId(e.target.value)} />
+            <input value={adminId} onChange={(e) => setAdminId(e.target.value)} />
             <button type="submit">Masuk</button>
             {err && <div className="small" style={{ color: '#b91c1c' }}>Error: {err}</div>}
           </form>
         </div>
       </div>
-      <Loading show={loading} />
     </div>
   );
 }
@@ -139,12 +153,16 @@ function AdminApp({ admin, goto }) {
         onBack={() => goto('menu')}
         right={
           <div className="small">
-            Signed in as <b>{admin.name}</b> • {admin.office_type} • {admin.region} &nbsp;
+            Signed in as <b>{admin.name}</b> • {admin.office_type} • {admin.region}{' '}
             <button
               className="secondary"
-              style={{ width: 'auto', padding: '6px 10px' }}
-              onClick={() => { localStorage.removeItem('dms_admin'); goto('menu'); }}
-            >Sign Out</button>
+              onClick={() => {
+                localStorage.removeItem('dms_admin');
+                goto('menu');
+              }}
+            >
+              Sign Out
+            </button>
           </div>
         }
       />
@@ -159,10 +177,10 @@ function AdminApp({ admin, goto }) {
 }
 
 function AdminCreate({ admin }) {
+  const [loading, setLoading] = useState(false);
   const [processes, setProcesses] = useState([]);
   const [processId, setProcessId] = useState('');
   const [created, setCreated] = useState(null);
-  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -182,10 +200,12 @@ function AdminCreate({ admin }) {
     e.preventDefault();
     setLoading(true);
     try {
-      const p = (processes || []).find(x => x.id === processId);
+      const p = (Array.isArray(processes) ? processes : []).find((x) => x.id === processId);
       const docType = p ? p.name : '';
       const data = await apiPost('/admin/documents', {
-        adminId: admin.admin_id, processId, docType
+        adminId: admin.admin_id,
+        processId,
+        docType,
       });
       setCreated(data);
     } catch (e) {
@@ -198,9 +218,11 @@ function AdminCreate({ admin }) {
   function printQr(url) {
     const w = window.open('', '_blank', 'noopener,noreferrer');
     const html = `<!doctype html><html><head><meta charset='utf-8'><title>Print QR</title>
-    <style>@page{size:5cm 5cm; margin:0}html,body{height:100%;margin:0}.wrap{width:5cm;height:5cm;display:flex;align-items:center;justify-content:center}img{width:5cm;height:5cm}</style></head>
-    <body><div class='wrap'><img id='qr' src='${url}'/></div>
-    <script>const img=document.getElementById('qr'); img.onload=()=>{window.focus();window.print();setTimeout(()=>window.close(),300)};<\/script>
+    <style>@page{size:5cm 5cm; margin:0}html,body{height:100%;margin:0}
+    .wrap{width:5cm;height:5cm;display:flex;align-items:center;justify-content:center}
+    img{width:5cm;height:5cm}</style></head><body>
+    <div class='wrap'><img id='qr' src='${url}'/></div>
+    <script>const img=document.getElementById('qr');img.onload=()=>{window.focus();window.print();setTimeout(()=>window.close(),300)};<\/script>
     </body></html>`;
     w.document.open(); w.document.write(html); w.document.close();
   }
@@ -212,10 +234,12 @@ function AdminCreate({ admin }) {
         <form onSubmit={createDoc}>
           <div className="row">
             <div>
-              <label>Layanan</label>
-              <select value={processId} onChange={e => setProcessId(e.target.value)}>
-                {(processes || []).map(p => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
+              <label>Proses</label>
+              <select value={processId} onChange={(e) => setProcessId(e.target.value)}>
+                {(Array.isArray(processes) ? processes : []).map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
                 ))}
               </select>
             </div>
@@ -228,7 +252,9 @@ function AdminCreate({ admin }) {
       {created && (
         <div className="card">
           <h3>Dokumen Dibuat</h3>
-          <div className="small">ID: <code className="code">{created.id}</code></div>
+          <div className="small">
+            ID: <code className="code">{created.id}</code>
+          </div>
           <p className="small">Print QR berikut dan tempel pada dokumen fisik.</p>
           <img
             src={`${API}${created.qrDownloadUrl}`}
@@ -245,222 +271,12 @@ function AdminCreate({ admin }) {
           </div>
         </div>
       )}
+
       <Loading show={loading} />
     </div>
   );
 }
 
-/* ========== Scan helper: extract documentId from many QR formats ========== */
-function extractDocumentId(textRaw) {
-  if (!textRaw) return null;
-  const text = String(textRaw).trim();
-
-  // 1) URL .../document/:id or .../documents/:id
-  const m1 = text.match(/\/documents?\/([0-9a-fA-F-]{36})(?:[/?#]|$)/);
-  if (m1) return m1[1];
-
-  // 2) URL ...?id=UUID
-  const m2 = text.match(/[?&]id=([0-9a-fA-F-]{36})(?:[&#]|$)/);
-  if (m2) return m2[1];
-
-  // 3) JSON { documentId: '...' } (or "id")
-  try {
-    const obj = JSON.parse(text);
-    if (obj?.documentId && /^[0-9a-fA-F-]{36}$/.test(obj.documentId)) return obj.documentId;
-    if (obj?.id && /^[0-9a-fA-F-]{36}$/.test(obj.id)) return obj.id;
-  } catch { /* not JSON */ }
-
-  // 4) Plain UUID
-  if (/^[0-9a-fA-F-]{36}$/.test(text)) return text;
-
-  return null;
-}
-
-/* ========== QR Scanner ========== */
-function QRScanner({ onScan }) {
-  const [error, setError] = useState(null);
-
-  useEffect(() => {
-    const s = new Html5QrcodeScanner('reader', { fps: 10, qrbox: 250 }, false);
-    s.render(
-      (text) => { try { onScan(text) } catch (e) { console.error(e) } },
-      (err) => setError(err?.toString?.() || 'Scan error')
-    );
-    return () => { try { s.clear() } catch { } };
-  }, [onScan]);
-
-  return (
-    <div>
-      <div id="reader" style={{ width: '100%' }} />
-      {error && <div className="small">Scan status: {error}</div>}
-    </div>
-  );
-}
-
-/* ========== Guest (Scan flow) ========== */
-function Guest({ goBack }) {
-  const [payload, setPayload] = useState(null); // {documentId}
-  const [state, setState] = useState(null);
-  const [loading, setLoading] = useState(false);
-
-  // Deep-link support: /document/:id atau /documents/:id
-  useEffect(() => {
-    const path = (window.location.pathname || '').toLowerCase();
-    if (path.startsWith('/document/') || path.startsWith('/documents/')) {
-      const id = extractDocumentId(window.location.href);
-      if (id) {
-        setPayload({ documentId: id });
-        fetchState(id);
-      }
-    }
-  }, []);
-
-  const handleScan = useCallback((text) => {
-    const id = extractDocumentId(text);
-    if (!id) { alert('QR tidak valid'); return; }
-    setPayload({ documentId: id });
-    fetchState(id);
-  }, []);
-
-  async function fetchState(id) {
-    setLoading(true);
-    try {
-      const d = await apiGet(`/scan/state/${id}`);
-      setState(d);
-    } catch (e) {
-      console.error(e);
-      alert('Dokumen tidak ditemukan / error state');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Tahap 1: Terima Dokumen (start tanpa activity)
-  async function acceptDocument() {
-    if (!state?.document?.id) return;
-    setLoading(true);
-    try {
-      await apiPost('/scan/start', { documentId: state.document.id, processActivityId: null });
-      await fetchState(state.document.id);
-    } catch (e) {
-      alert(e.message || 'Gagal menerima dokumen');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Tahap 2: Mulai proses aktual
-  async function startActivity() {
-    if (!state?.document?.id) return;
-    const nextId = state?.state?.next?.id || null;
-    if (!nextId) return;
-    setLoading(true);
-    try {
-      await apiPost('/scan/start', { documentId: state.document.id, processActivityId: nextId });
-      await fetchState(state.document.id);
-    } catch (e) {
-      alert(e.message || 'Gagal mulai proses');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Tahap 3: Selesai proses (tanpa mengubah decision logic lama)
-  async function finishActivity(decisionArg) {
-    if (!state?.document?.id) return;
-    const body = state?.state?.current?.id
-      ? { activityId: state.state.current.id }
-      : { documentId: state.document.id };
-    if (decisionArg) body.decision = decisionArg;
-
-    setLoading(true);
-    try {
-      await apiPost('/scan/finish', body);
-      await fetchState(state.document.id);
-    } catch (e) {
-      alert(e.message || 'Gagal menyelesaikan');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Dokumen belum pernah diterima jika belum ada scan sama sekali
-  const notAcceptedYet = !state?.scans || state.scans.length === 0;
-
-  return (
-    <div>
-      <Header title="Scan QR" onBack={goBack} />
-      <div className="container">
-        <div className="card">
-          <QRScanner onScan={handleScan} />
-          {payload && (
-            <div className="small">
-              Document ID: <code className="code">{payload.documentId}</code>
-            </div>
-          )}
-        </div>
-
-        {state && (
-          <div className="card">
-            <div className="small" style={{ marginBottom: 8 }}>
-              Layanan: <b>{state.document.doc_type || '-'}</b>{' '}
-              • Kantor: <b>{state.document.office_type || '-'}</b>{' '}
-              • Wilayah: {state.document.region || '-'}
-            </div>
-
-            {notAcceptedYet ? (
-              // Hanya tombol Terima Dokumen
-              <button onClick={acceptDocument}>Terima Dokumen</button>
-            ) : state.state.status === 'COMPLETED' ? (
-              <div className="small"><b>Selesai.</b> Tidak ada proses lagi.</div>
-            ) : state.state.status === 'IN_PROGRESS' ? (() => {
-              const cur = state.state.current;
-              const hasDecision = !!(cur?.next_on_accept || cur?.next_on_reject);
-              return (
-                <div>
-                  <div className="small" style={{ marginBottom: 8 }}>
-                    Sedang dikerjakan (Proses): <b>{cur.name || cur.activity_name}</b>
-                  </div>
-                  {hasDecision && cur.is_decision ? (
-                    <div className="row">
-                      <div>
-                        <label>Decision</label>
-                        <div className="flex">
-                          <button onClick={() => finishActivity('accept')}>
-                            {cur.decision_accept_label || 'Lanjut'}
-                          </button>
-                          <button className="secondary" onClick={() => finishActivity('reject')}>
-                            {cur.decision_reject_label || 'Tolak'}
-                          </button>
-                        </div>
-                      </div>
-                      <div />
-                    </div>
-                  ) : (
-                    <button className="secondary" onClick={() => finishActivity()}>
-                      Selesai
-                    </button>
-                  )}
-                </div>
-              );
-            })() : (
-              // READY → tampilkan hanya “Proses berikutnya” & tombol Mulai (tanpa waiting/resting)
-              <div>
-                <div className="small" style={{ marginBottom: 8 }}>
-                  Proses berikutnya: <b>{state.state.next?.name || '-'}</b>
-                </div>
-                <button onClick={startActivity}>Mulai</button>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-      <Loading show={loading} />
-    </div>
-  );
-}
-
-/* ========== Reports ========== */
 function Reports() {
   const [summary, setSummary] = useState([]);
   const [inputId, setInputId] = useState('');
@@ -469,19 +285,17 @@ function Reports() {
 
   function hms(s) {
     if (s == null) return '-';
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    return [h, m, sec].map(v => String(v).padStart(2, '0')).join(':');
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return [h, m, sec].map((v) => String(v).padStart(2, '0')).join(':');
   }
-
   async function fetchDetail(id) {
+    if (!id) return;
     setLoading(true);
     try {
       const d = await apiGet(`/admin/documents/${id}`);
       setDetail(d);
-    } catch {
-      alert('Gagal mengambil detail');
+    } catch (e) {
+      alert(e.message || 'Gagal mengambil detail');
     } finally {
       setLoading(false);
     }
@@ -489,12 +303,12 @@ function Reports() {
   async function fetchSummary() {
     try {
       const d = await apiGet('/admin/reports/summary');
-      setSummary(Array.isArray(d) ? d : (d?.rows || []));
-    } catch {
-      setSummary([]);
+      setSummary(Array.isArray(d) ? d : d?.rows || []);
+    } catch (e) {
+      console.error(e);
     }
   }
-  useEffect(() => { fetchSummary() }, []);
+  useEffect(() => { fetchSummary(); }, []);
 
   return (
     <div className="container">
@@ -503,39 +317,41 @@ function Reports() {
         <div className="row">
           <div>
             <label>Document ID</label>
-            <input value={inputId} onChange={e => setInputId(e.target.value)} placeholder="UUID dokumen" />
+            <input value={inputId} onChange={(e) => setInputId(e.target.value)} placeholder="UUID dokumen" />
           </div>
           <div>
             <label>&nbsp;</label>
             <button onClick={() => fetchDetail(inputId)}>Lihat Detail</button>
           </div>
         </div>
-
         {detail && (
           <div style={{ marginTop: 12 }}>
             <div style={{ marginBottom: 8 }}>
               <div>
-                <b>{detail.document.process_name || detail.document.doc_type || '-'}</b>
-                {' • '}Kantor: <b>{detail.document.office_type || '-'}</b>
-                {' • '}Wilayah: {detail.document.region || '-'}
+                <b>{detail.document.process_name || detail.document.doc_type || '-'}</b> • Kantor:{' '}
+                <b>{detail.document.office_type || '-'}</b> • Wilayah: {detail.document.region || '-'}
               </div>
               <div className="small">
-                Overall: <span className="badge">{hms(detail.overallSeconds)}</span>{' '}
-                Total Execution: <span className="badge">{hms(detail.totalExecutionSeconds)}</span>{' '}
-                Total Waiting: <span className="badge">{hms(detail.totalWaitingSeconds)}</span>{' '}
-                Total Resting: <span className="badge">{hms(detail.totalRestingSeconds)}</span>
+                Overall: <span className="badge">{hms(detail.overallSeconds)}</span> • Total Execution:{' '}
+                <span className="badge">{hms(detail.totalExecutionSeconds)}</span> • Total Waiting:{' '}
+                <span className="badge">{hms(detail.totalWaitingSeconds)}</span> • Total Resting:{' '}
+                <span className="badge">{hms(detail.totalRestingSeconds)}</span>
               </div>
             </div>
-
-            <h4>Log Proses</h4>
+            <h4>Log Aktivitas</h4>
             <table>
               <thead>
                 <tr>
-                  <th>Start</th><th>End</th><th>Durasi</th><th>Waiting</th><th>Resting</th><th>Proses</th>
+                  <th>Start</th>
+                  <th>End</th>
+                  <th>Durasi</th>
+                  <th>Waiting</th>
+                  <th>Resting</th>
+                  <th>Aktivitas</th>
                 </tr>
               </thead>
               <tbody>
-                {(detail.scans || []).map(s => (
+                {(detail.scans || []).map((s) => (
                   <tr key={s.id}>
                     <td>{new Date(s.start_time).toLocaleString()}</td>
                     <td>{s.end_time ? new Date(s.end_time).toLocaleString() : '-'}</td>
@@ -556,12 +372,18 @@ function Reports() {
         <table>
           <thead>
             <tr>
-              <th>ID</th><th>Layanan</th><th>Kantor</th><th>Wilayah</th><th>Status</th>
-              <th>Total Exec</th><th>Total Waiting</th><th>Total Resting</th>
+              <th>ID</th>
+              <th>Proses</th>
+              <th>Kantor</th>
+              <th>Wilayah</th>
+              <th>Status</th>
+              <th>Total Exec</th>
+              <th>Total Waiting</th>
+              <th>Total Resting</th>
             </tr>
           </thead>
           <tbody>
-            {(Array.isArray(summary) ? summary : []).map(r => (
+            {(Array.isArray(summary) ? summary : []).map((r) => (
               <tr key={r.id}>
                 <td className="code">{r.id?.slice(0, 8) || '-'}…</td>
                 <td>{r.process_name || r.doc_type}</td>
@@ -576,26 +398,246 @@ function Reports() {
           </tbody>
         </table>
       </div>
+
       <Loading show={loading} />
     </div>
   );
 }
 
-/* ========== App ========== */
-export default function App() {
-  const [page, setPage] = useState('menu');
+/* ============== Guest (scan) ============== */
+function Guest({ goBack, initialDocumentId }) {
+  const [loading, setLoading] = useState(false);
+  const [payload, setPayload] = useState(initialDocumentId ? { documentId: initialDocumentId } : null);
+  const [state, setState] = useState(null);
+  const [acceptedFirst, setAcceptedFirst] = useState(false); // after "Terima Dokumen", before new state arrives
 
-  const admin = useMemo(() => {
-    try { return JSON.parse(localStorage.getItem('dms_admin') || 'null') } catch { return null }
-  }, [page]);
+  // ---------- helpers ----------
+  const docId = state?.document?.id || payload?.documentId || null;
+  const hasScans = (state?.scans?.length ?? 0) > 0;
+  const status = state?.state?.status;               // 'OPEN' | 'IN_PROGRESS' | 'COMPLETED' | undefined
+  const hasCurrent = !!state?.state?.current;
+  const nextName = state?.state?.next?.name || '(memuat...)';
+  const curName  = state?.state?.current?.name || state?.state?.current?.activity_name || '(memuat...)';
+
+  function setScannedId(id) {
+    setPayload({ documentId: id });
+    fetchState(id);
+  }
+
+  async function fetchState(id) {
+    if (!id) return;
+    setLoading(true);
+    try {
+      const d = await apiGet(`/scan/state/${id}`);
+      setState(d);
+    } catch (e) {
+      console.error('[fetchState]', e);
+      // Biarkan action area tetap ada – user masih bisa mencoba lagi
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const handleScan = (text) => {
+    try {
+      const obj = JSON.parse(text);
+      if (obj?.documentId) return setScannedId(obj.documentId);
+    } catch {}
+    if (/^[0-9a-fA-F-]{36}$/.test(text)) return setScannedId(text);
+    if (typeof text === 'string') {
+      const m = text.match(/\/documents\/([0-9a-fA-F-]{36})/);
+      if (m) return setScannedId(m[1]);
+    }
+    alert('QR tidak valid');
+  };
+
+  async function startActivityFirst() {
+    // TERIMA DOKUMEN (start pertama tanpa aktivitas)
+    if (!docId) return;
+    setAcceptedFirst(true);      // tahan UI pada mode pasca-terima
+    setLoading(true);
+    try {
+      await apiPost('/scan/start', { documentId: docId, processActivityId: null });
+      await fetchState(docId);   // akan mengubah status menjadi OPEN (tanpa current) → tampil tombol Mulai
+    } catch (e) {
+      console.error('[startActivityFirst]', e);
+      alert(e.message || 'Gagal menerima dokumen');
+      setAcceptedFirst(false);   // rollback agar tombol Terima Dokumen muncul lagi
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function startActivityNext() {
+    if (!docId) return;
+    setLoading(true);
+    try {
+      const pid = state?.state?.next?.id ?? null;
+      await apiPost('/scan/start', { documentId: docId, processActivityId: pid });
+      await fetchState(docId);
+    } catch (e) {
+      console.error('[startActivityNext]', e);
+      alert(e.message || 'Gagal mulai proses');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function finishActivity(decisionArg) {
+    if (!docId) return;
+    setLoading(true);
+    try {
+      const body = state?.state?.current?.id
+        ? { activityId: state.state.current.id }
+        : { documentId: docId };
+      if (decisionArg === 'accept' || decisionArg === 'reject') body.decision = decisionArg;
+      await apiPost('/scan/finish', body);
+      await fetchState(docId);
+    } catch (e) {
+      console.error('[finishActivity]', e);
+      alert(e.message || 'Gagal menyelesaikan proses');
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    if (page === 'adminSignIn' && admin) setPage('admin');
-  }, [page, admin]);
+    if (initialDocumentId) setScannedId(initialDocumentId);
+  }, [initialDocumentId]);
+
+  // ---------- UI ----------
+  return (
+    <div>
+      <Header title="Scan QR" onBack={goBack} />
+      <div className="container">
+        {/* Scanner card (tetap selalu ada di atas) */}
+        <div className="card">
+          <QRScanner onScan={handleScan} />
+          {payload && (
+            <div className="small" style={{ marginTop: 8 }}>
+              Document ID: <span className="code">{payload.documentId}</span>
+            </div>
+          )}
+        </div>
+
+        {/* ACTION AREA – finite state dengan fallback supaya tidak pernah "blank" */}
+
+        {/* A. Belum ada state sama sekali (baru scan) → Terima Dokumen */}
+        {payload && !state && !acceptedFirst && (
+          <div className="card">
+            <div className="small" style={{ marginBottom: 8 }}>
+              Layanan: <b>-</b> • Kantor: <b>-</b> • Wilayah: -
+            </div>
+            <button onClick={startActivityFirst}>Terima Dokumen</button>
+          </div>
+        )}
+
+        {/* B. Habis klik Terima, state belum balik → tampil info + (opsional) Mulai ketika sudah ada next */}
+        {acceptedFirst && !state && (
+          <div className="card">
+            <div className="small" style={{ marginBottom: 8 }}>
+              Dokumen diterima. Memuat status proses…
+            </div>
+          </div>
+        )}
+
+        {/* C. Sudah ada state */}
+        {state && (
+          <>
+            {/* C1. Pertama kali (OPEN, belum ada current, belum ada scan) → tombol Terima Dokumen */}
+            {status === 'OPEN' && !hasCurrent && !hasScans && (
+              <div className="card">
+                <div className="small" style={{ marginBottom: 8 }}>
+                  Layanan: <b>{state.document.doc_type || '-'}</b> • Kantor: <b>{state.document.office_type || '-'}</b> • Wilayah: {state.document.region || '-'}
+                </div>
+                <button onClick={startActivityFirst}>Terima Dokumen</button>
+              </div>
+            )}
+
+            {/* C2. OPEN tanpa current (setelah terima, atau antar-aktivitas) → tombol Mulai */}
+            {status === 'OPEN' && !hasCurrent && hasScans && (
+              <div className="card">
+                <div className="small" style={{ marginBottom: 8 }}>
+                  Layanan: <b>{state.document.doc_type || '-'}</b> • Kantor: <b>{state.document.office_type || '-'}</b> • Wilayah: {state.document.region || '-'}
+                </div>
+                <div className="small" style={{ marginBottom: 8 }}>
+                  Proses berikutnya: <b>{nextName}</b>
+                </div>
+                <button onClick={startActivityNext}>Mulai</button>
+              </div>
+            )}
+
+            {/* C3. IN_PROGRESS → tombol Selesai (atau decision) */}
+            {status === 'IN_PROGRESS' && hasCurrent && (
+              <div className="card">
+                <div className="small" style={{ marginBottom: 8 }}>
+                  Layanan: <b>{state.document.doc_type || '-'}</b> • Kantor: <b>{state.document.office_type || '-'}</b> • Wilayah: {state.document.region || '-'}
+                </div>
+                <div className="small" style={{ marginBottom: 8 }}>
+                  Sedang dikerjakan: <b>{curName}</b>
+                </div>
+
+                {state.state.current.is_decision ? (
+                  <div className="row">
+                    <div>
+                      <label>Decision</label>
+                      <div className="flex">
+                        <button onClick={() => finishActivity('accept')}>
+                          {state.state.current.decision_accept_label || 'Lanjut'}
+                        </button>
+                        <button className="secondary" onClick={() => finishActivity('reject')}>
+                          {state.state.current.decision_reject_label || 'Tolak'}
+                        </button>
+                      </div>
+                    </div>
+                    <div />
+                  </div>
+                ) : (
+                  <button className="secondary" onClick={() => finishActivity()}>Selesai</button>
+                )}
+              </div>
+            )}
+
+            {/* C4. COMPLETED */}
+            {status === 'COMPLETED' && (
+              <div className="card">
+                <div className="small"><b>Proses selesai.</b> Tidak ada aktivitas lanjutan.</div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <Loading show={loading} />
+    </div>
+  );
+}
+
+/* ============== App root ============== */
+export default function App() {
+  const [page, setPage] = useState('menu');
+  const [deepLinkDocId, setDeepLinkDocId] = useState(null);
+
+  const admin = useMemo(() => {
+    try {
+      return JSON.parse(localStorage.getItem('dms_admin') || 'null');
+    } catch {
+      return null;
+    }
+  }, [page]);
+
+  // deep-link: /documents/:id → buka Guest dengan initialDocumentId
+  useEffect(() => {
+    const m = window.location.pathname.match(/^\/documents\/([0-9a-fA-F-]{36})$/);
+    if (m) {
+      setDeepLinkDocId(m[1]);
+      setPage('guest');
+    }
+  }, []);
 
   if (page === 'menu') return <MainMenu goto={setPage} />;
+  if (page === 'guest') return <Guest goBack={() => setPage('menu')} initialDocumentId={deepLinkDocId} />;
   if (page === 'adminSignIn') return <AdminSignIn onSignedIn={() => setPage('admin')} onBack={() => setPage('menu')} />;
-  if (page === 'guest') return <Guest goBack={() => setPage('menu')} />;
   if (page === 'admin') {
     if (!admin) return <AdminSignIn onSignedIn={() => setPage('admin')} onBack={() => setPage('menu')} />;
     return <AdminApp admin={admin} goto={setPage} />;
