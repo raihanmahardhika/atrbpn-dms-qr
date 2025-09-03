@@ -1,4 +1,5 @@
-﻿// ===== CORS (fix) =====
+﻿import finishHandler from './finish.js';
+// ===== CORS (fix) =====
 const ALLOWED_ORIGINS = [
   'https://atrbpn-dms.web.app',
   'https://atrbpn-dms.firebaseapp.com',
@@ -23,11 +24,16 @@ function setCors(req, res) {
 // di handler utama:
 export default async function handler(req, res) {
   setCors(req, res);
+  if (req.method === 'OPTIONS') return res.status(204).end();
 
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 204;
-    return res.end();
+  // path tanpa query (lebih aman pakai URL)
+  const path = new URL(req.url, 'http://x').pathname;
+
+  if (path === '/api/scan/finish') {
+    // delegasikan ke handler spesifik finish.js
+    return finishHandler(req, res);
   }
 
-  // ... routing /api/scan/start, /api/scan/state/:id, dst
+  // biarkan /api/scan/start ditangani oleh start.js (route spesifik)
+  return res.status(404).json({ error: 'Not Found' });
 }
