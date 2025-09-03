@@ -126,19 +126,19 @@ export default async function handler(req, res) {
     const proc = (await q(`select process_id from documents where id = $1`, [docId]))?.[0];
 
     const next = (await q(
-      `select pa.id
-         from process_activities pa
-         left join activity_scans s
-           on s.process_activity_id = pa.id
-          and s.document_id = $1
-          and s.end_time is not null
-        where pa.process_id = $2
-        group by pa.id, pa.order_index
-        having count(s.id) = 0
-        order by pa.order_index asc
-        limit 1`,
-      [docId, proc.process_id]
-    ))?.[0];
+  `select pa.id
+     from process_activities pa
+     left join activity_scans s
+       on s.process_activity_id = pa.id
+      and s.document_id = $1
+      and s.end_time is not null
+    where pa.process_id = $2
+    group by pa.id, pa.order_no
+    having count(s.id) = 0
+    order by pa.order_no asc
+    limit 1`,
+  [docId, proc.process_id]
+))?.[0];
 
     await q(`update documents set status = $2 where id = $1`, [docId, next ? 'WAITING' : 'DONE']);
 
