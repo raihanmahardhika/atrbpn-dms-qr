@@ -1,173 +1,147 @@
 ﻿// backend/api/scan/start.js
-import pg from "pg";
+import * as DB from '../../src/db.js';
 
-// ====== CORS helper (inline) ======
-function setCors(req, res) {
-  const origins = (process.env.CORS_ORIGIN || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-  const origin = req.headers.origin || "";
-  const allow = origins.length ? origins.includes(origin) : true;
-
-  if (allow) res.setHeader("Access-Control-Allow-Origin", origin || "*");
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "content-type,authorization"
-  );
+// ---- DB adapter (compatible with your db.js export)
+function queryFn() {
+  if (typeof DB.query === 'function') return DB.query;
+  if (DB.default && typeof DB.default.query === 'function') return DB.default.query.bind(DB.default);
+  if (DB.db && typeof DB.db.query === 'function') return DB.db.query.bind(DB.db);
+  if (DB.pool && typeof DB.pool.query === 'function') return DB.pool.query.bind(DB.pool);
+  if (typeof DB.execute === 'function') return DB.execute;
+  return null;
 }
 
-// ====== PG pool ======
-const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl:
-    process.env.PG_SSL === "true"
-      ? { rejectUnauthorized: false }
-      : undefined,
-});
+// ---- CORS (single-origin echo)
+const ORIGINS =
+  (process.env.CORS_ORIGIN || process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 
-async function jsonBody(req) {
-  if (req.body && typeof req.body === "object") return req.body;
-  return await new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", chunk => (data += chunk));
-    req.on("end", () => {
-      try {
-        resolve(data ? JSON.parse(data) : {});
-      } catch (e) {
-        reject(e);
-      }
-    });
-  });
+function setCORS(req, res) {
+  const caller = req.headers.origin;
+  let allow = '*';
+  if (ORIGINS.length === 1) allow = ORIGINS[0];
+  else if (caller && ORIGINS.includes(caller)) allow = caller;
+  else if (ORIGINS.length > 0) allow = ORIGINS[0];
+
+  res.setHeader('Access-Control-Allow-Origin', allow);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+// ---- detect FK column in activity_scans
+async function getScanActivityCol(q) {
+  const candidates = ['activity_id', 'process_activity_id', 'master_activity_id'];
+  const r = await q(
+    `select column_name
+       from information_schema.columns
+      where table_name = 'activity_scans'
+        and column_name = any($1::text[])`,
+    [candidates]
+  );
+  return r.rows.length ? r.rows[0].column_name : 'activity_id';
 }
 
 export default async function handler(req, res) {
-  setCors(req, res);
-  if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
-  }
-  if (req.method !== "POST") {
-    res.status(405).json({ error: "Method Not Allowed" });
-    return;
-  }
+  setCORS(req, res);
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  const client = await pool.connect();
+  const q = queryFn();
+  if (!q) return res.status(500).json({ error: 'DB adapter not found' });
+
   try {
-    const { documentId, processActivityId, acceptOnly } = await jsonBody(req);
-    if (!documentId) {
-      res.status(400).json({ error: "documentId is required" });
-      return;
-    }
+    const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+    const { documentId, processActivityId, acceptOnly } = body;
 
-    await client.query("BEGIN");
+    if (!documentId) return res.status(400).json({ error: 'documentId required' });
 
-    // Ambil dokumen
-    const { rows: docRows } = await client.query(
-      `SELECT id, process_id, status FROM documents WHERE id = $1`,
-      [documentId]
-    );
-    if (!docRows.length) {
-      await client.query("ROLLBACK");
-      res.status(404).json({ error: "Document not found" });
-      return;
-    }
-    const doc = docRows[0];
+    const scanCol = await getScanActivityCol(q);
 
-    // 1) Terima Dokumen saja (reception)
+    // 1) fetch document
+    const d = await q(`select * from documents where id = $1`, [documentId]);
+    const doc = d.rows?.[0];
+    if (!doc) return res.status(404).json({ error: 'Document not found' });
+
+    // If this is the first “Terima Dokumen”, just mark WAITING and return
     if (acceptOnly) {
-      // Hanya transisi OPEN -> WAITING (biar tombol "Terima Dokumen" ke "Mulai")
-      if (doc.status === "OPEN") {
-        await client.query(
-          `UPDATE documents SET status = 'WAITING' WHERE id = $1`,
-          [documentId]
-        );
-      }
-      await client.query("COMMIT");
-      res.json({ initialized: true });
-      return;
-    }
-
-    // 2) Mulai proses real (start activity)
-    // Tentukan activity yang akan dimulai.
-    let actId = processActivityId;
-    if (!actId) {
-      // kalau tidak dikirim, pilih activity pertama (order_no paling kecil) di proses tsb
-      const { rows: nextRows } = await client.query(
-        `SELECT id
-         FROM process_activities
-         WHERE process_id = $1
-         ORDER BY order_no ASC
-         LIMIT 1`,
-        [doc.process_id]
+      const toStatus = doc.status && doc.status !== 'OPEN' ? doc.status : 'WAITING';
+      await q(
+        `update documents
+            set status = $2,
+                received_at = coalesce(received_at, now()),
+                updated_at = now()
+          where id = $1`,
+        [documentId, toStatus]
       );
-      if (!nextRows.length) {
-        await client.query("ROLLBACK");
-        res.status(409).json({ error: "No activities defined for process" });
-        return;
-      }
-      actId = nextRows[0].id;
+      return res.status(200).json({ ok: true, accepted: true, status: toStatus });
     }
 
-    // Pastikan tidak ada activity berjalan (end_time IS NULL)
-    const { rows: runningRows } = await client.query(
-      `SELECT id FROM scans
-       WHERE document_id = $1 AND end_time IS NULL
-       ORDER BY start_time DESC
-       LIMIT 1`,
-      [documentId]
-    );
-    if (runningRows.length) {
-      // Sudah ada yang berjalan, tidak boleh start baru
-      await client.query("ROLLBACK");
-      res.status(409).json({ error: "An activity is already running" });
-      return;
+    // 2) identify next activity if not passed
+    let nextId = processActivityId;
+    if (!nextId) {
+      const nx = await q(
+        `select pa.id
+           from process_activities pa
+      left join activity_scans s
+             on s.${scanCol} = pa.id
+            and s.document_id = $1
+            and s.end_time is not null
+          where pa.process_id = $2
+       group by pa.id
+         having count(s.id) = 0
+       order by pa.order_no asc
+          limit 1`,
+        [documentId, doc.process_id]
+      );
+      nextId = nx.rows?.[0]?.id || null;
+    }
+    if (!nextId) {
+      // No next activity => already done
+      await q(`update documents set status = 'DONE', updated_at = now() where id = $1`, [documentId]);
+      return res.status(200).json({ ok: true, initialized: false, status: 'DONE' });
     }
 
-    // Hitung waiting time (durasi dari selesai aktivitas terakhir / dari reception)
-    // Ambil end_time terakhir (kalau ada)
-    const { rows: lastDone } = await client.query(
-      `SELECT end_time
-       FROM scans
-       WHERE document_id = $1 AND end_time IS NOT NULL
-       ORDER BY end_time DESC
-       LIMIT 1`,
+    // 3) compute waitingSeconds since last end_time
+    const lastDone = await q(
+      `select end_time
+         from activity_scans
+        where document_id = $1
+          and end_time is not null
+     order by end_time desc
+        limit 1`,
       [documentId]
     );
     let waitingSeconds = 0;
-    if (lastDone.length) {
-      const lastEnd = new Date(lastDone[0].end_time).getTime();
-      waitingSeconds = Math.max(0, Math.floor((Date.now() - lastEnd) / 1000));
+    if (lastDone.rows?.[0]?.end_time) {
+      waitingSeconds = Math.max(
+        0,
+        Math.floor((Date.now() - new Date(lastDone.rows[0].end_time).getTime()) / 1000)
+      );
     }
 
-    // Mulai activity
-    await client.query(
-      `INSERT INTO activity_scans (document_id, activity_id, start_time, waiting_seconds, resting_seconds)
-       VALUES ($1, $2, NOW(), $3, 0)`,
-      [documentId, actId, waitingSeconds]
+    // 4) start the activity
+    const ins = await q(
+      `insert into activity_scans (document_id, ${scanCol}, start_time, waiting_seconds, created_at)
+       values ($1, $2, now(), $3, now())
+       returning id, start_time`,
+      [documentId, nextId, waitingSeconds]
     );
 
-    // Update status dokumen
-    await client.query(
-      `UPDATE documents SET status = 'IN_PROGRESS' WHERE id = $1`,
-      [documentId]
-    );
+    // 5) mark doc IN_PROGRESS
+    await q(`update documents set status = 'IN_PROGRESS', updated_at = now() where id = $1`, [documentId]);
 
-    await client.query("COMMIT");
-    res.json({
-      initialized: false,
-      startTime: new Date().toISOString(),
-      waitingSeconds,
-      restingSeconds: 0,
+    return res.status(200).json({
+      ok: true,
+      initialized: true,
+      activityScanId: ins.rows[0].id,
+      startTime: ins.rows[0].start_time,
+      waitingSeconds
     });
-  } catch (e) {
-    try { await pool.query("ROLLBACK"); } catch {}
-    console.error(e);
-    res.status(500).json({ error: "Internal error", detail: String(e) });
-  } finally {
-    client.release();
+  } catch (err) {
+    console.error('scan/start error:', err);
+    return res.status(500).json({ error: 'Internal error' });
   }
 }

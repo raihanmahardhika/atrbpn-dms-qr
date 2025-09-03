@@ -1,174 +1,133 @@
 ﻿// backend/api/scan/finish.js
-import pg from "pg";
+import * as DB from '../../src/db.js';
 
-// ====== CORS helper ======
-function setCors(req, res) {
-  const origins = (process.env.CORS_ORIGIN || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-  const origin = req.headers.origin || "";
-  const allow = origins.length ? origins.includes(origin) : true;
-
-  if (allow) res.setHeader("Access-Control-Allow-Origin", origin || "*");
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "content-type,authorization"
-  );
+function queryFn() {
+  if (typeof DB.query === 'function') return DB.query;
+  if (DB.default && typeof DB.default.query === 'function') return DB.default.query.bind(DB.default);
+  if (DB.db && typeof DB.db.query === 'function') return DB.db.query.bind(DB.db);
+  if (DB.pool && typeof DB.pool.query === 'function') return DB.pool.query.bind(DB.pool);
+  if (typeof DB.execute === 'function') return DB.execute;
+  return null;
 }
 
-const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl:
-    process.env.PG_SSL === "true"
-      ? { rejectUnauthorized: false }
-      : undefined,
-});
+const ORIGINS =
+  (process.env.CORS_ORIGIN || process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 
-async function jsonBody(req) {
-  if (req.body && typeof req.body === "object") return req.body;
-  return await new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", chunk => (data += chunk));
-    req.on("end", () => {
-      try {
-        resolve(data ? JSON.parse(data) : {});
-      } catch (e) {
-        reject(e);
-      }
-    });
-  });
+function setCORS(req, res) {
+  const caller = req.headers.origin;
+  let allow = '*';
+  if (ORIGINS.length === 1) allow = ORIGINS[0];
+  else if (caller && ORIGINS.includes(caller)) allow = caller;
+  else if (ORIGINS.length > 0) allow = ORIGINS[0];
+
+  res.setHeader('Access-Control-Allow-Origin', allow);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+async function getScanActivityCol(q) {
+  const candidates = ['activity_id', 'process_activity_id', 'master_activity_id'];
+  const r = await q(
+    `select column_name
+       from information_schema.columns
+      where table_name = 'activity_scans'
+        and column_name = any($1::text[])`,
+    [candidates]
+  );
+  return r.rows.length ? r.rows[0].column_name : 'activity_id';
 }
 
 export default async function handler(req, res) {
-  setCors(req, res);
-  if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
-  }
-  if (req.method !== "POST") {
-    res.status(405).json({ error: "Method Not Allowed" });
-    return;
-  }
+  setCORS(req, res);
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  const client = await pool.connect();
+  const q = queryFn();
+  if (!q) return res.status(500).json({ error: 'DB adapter not found' });
+
   try {
-    const { activityId, documentId, decision } = await jsonBody(req);
-    if (!activityId && !documentId) {
-      res.status(400).json({ error: "activityId or documentId is required" });
-      return;
-    }
+    const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+    const { documentId, activityId, decision } = body; // decision optional ('accept'/'reject') if your flow needs it
+    if (!documentId) return res.status(400).json({ error: 'documentId required' });
 
-    await client.query("BEGIN");
+    const scanCol = await getScanActivityCol(q);
 
-    // Temukan scan yang sedang berjalan
-    let running;
+    // resolve the active row to finish
+    let cur;
     if (activityId) {
-      const { rows } = await client.query(
-        `SELECT s.*, d.process_id
-         FROM scans s
-         JOIN documents d ON d.id = s.document_id
-         WHERE s.id = $1`,
-        [activityId]
+      const r = await q(
+        `select *
+           from activity_scans
+          where document_id = $1
+            and ${scanCol} = $2
+            and end_time is null
+          order by start_time desc
+          limit 1`,
+        [documentId, activityId]
       );
-      if (!rows.length) {
-        await client.query("ROLLBACK");
-        res.status(404).json({ error: "Activity not found" });
-        return;
-      }
-      running = rows[0];
-      if (running.end_time) {
-        await client.query("ROLLBACK");
-        res.status(409).json({ error: "Activity already finished" });
-        return;
-      }
+      cur = r.rows?.[0];
     } else {
-      // cari scan yang belum selesai untuk dokumen tsb
-      const { rows } = await client.query(
-        `SELECT s.*, d.process_id
-         FROM scans s
-         JOIN documents d ON d.id = s.document_id
-         WHERE s.document_id = $1 AND s.end_time IS NULL
-         ORDER BY s.start_time DESC
-         LIMIT 1`,
+      const r = await q(
+        `select *
+           from activity_scans
+          where document_id = $1
+            and end_time is null
+          order by start_time desc
+          limit 1`,
         [documentId]
       );
-      if (!rows.length) {
-        await client.query("ROLLBACK");
-        res.status(404).json({ error: "No running activity for document" });
-        return;
-      }
-      running = rows[0];
+      cur = r.rows?.[0];
     }
 
-    // Tutup aktivitas
-    const startTs = new Date(running.start_time).getTime();
-    const durationSeconds = Math.max(0, Math.floor((Date.now() - startTs) / 1000));
+    if (!cur) return res.status(404).json({ error: 'No active activity' });
 
-    await client.query(
-      `UPDATE activity_scans
-       SET end_time = NOW(), duration_seconds = $1
-       WHERE id = $2`,
-      [durationSeconds, running.id]
+    // finish it
+    const upd = await q(
+      `update activity_scans
+          set end_time = now(),
+              duration_seconds = extract(epoch from (now() - start_time))::int,
+              updated_at = now()
+        where id = $1
+        returning duration_seconds`,
+      [cur.id]
     );
 
-    // Tentukan next activity (pakai urutan default; kalau kamu memakai branching decision via kolom next_on_* tinggal aktifkan bagian itu)
-    const { rows: curInfo } = await client.query(
-      `SELECT pa.id, pa.process_id, pa.order_no, pa.is_decision,
-              pa.next_on_accept, pa.next_on_reject
-       FROM process_activities pa
-       WHERE pa.id = $1`,
-      [running.activity_id]
+    // is there a next activity?
+    const doc = await q(`select process_id from documents where id = $1`, [documentId]);
+    const processId = doc.rows?.[0]?.process_id;
+
+    const nx = await q(
+      `select pa.id
+         from process_activities pa
+    left join activity_scans s
+           on s.${scanCol} = pa.id
+          and s.document_id = $1
+          and s.end_time is not null
+        where pa.process_id = $2
+     group by pa.id
+       having count(s.id) = 0
+     order by pa.order_no asc
+        limit 1`,
+      [documentId, processId]
     );
-    const cur = curInfo[0];
 
-    let nextActivityId = null;
+    let status = 'DONE';
+    if (nx.rows?.length) status = 'WAITING';
 
-    // 1) Jika ada branching decision & decision dikirim
-    if (cur && cur.is_decision && decision) {
-      if (decision === "accept" && cur.next_on_accept) nextActivityId = cur.next_on_accept;
-      if (decision === "reject" && cur.next_on_reject) nextActivityId = cur.next_on_reject;
-    }
+    await q(`update documents set status = $2, updated_at = now() where id = $1`, [documentId, status]);
 
-    // 2) Kalau belum dapat, pakai urutan default (order_no berikutnya)
-    if (!nextActivityId && cur) {
-      const { rows: nextRows } = await client.query(
-        `SELECT id
-         FROM process_activities
-         WHERE process_id = $1 AND order_no > $2
-         ORDER BY order_no ASC
-         LIMIT 1`,
-        [cur.process_id, cur.order_no]
-      );
-      if (nextRows.length) nextActivityId = nextRows[0].id;
-    }
-
-    // Update status dokumen
-    if (nextActivityId) {
-      // Masuk kembali ke WAITING agar tombol di FE berubah jadi "Mulai"
-      await client.query(
-        `UPDATE documents SET status = 'WAITING' WHERE id = $1`,
-        [running.document_id]
-      );
-      await client.query("COMMIT");
-      res.json({ durationSeconds, done: false });
-    } else {
-      // Tidak ada kelanjutan -> DONE
-      await client.query(
-        `UPDATE documents SET status = 'DONE' WHERE id = $1`,
-        [running.document_id]
-      );
-      await client.query("COMMIT");
-      res.json({ durationSeconds, done: true });
-    }
-  } catch (e) {
-    try { await pool.query("ROLLBACK"); } catch {}
-    console.error(e);
-    res.status(500).json({ error: "Internal error", detail: String(e) });
-  } finally {
-    client.release();
+    return res.status(200).json({
+      ok: true,
+      done: status === 'DONE',
+      durationSeconds: upd.rows?.[0]?.duration_seconds ?? null,
+      nextStatus: status
+    });
+  } catch (err) {
+    console.error('scan/finish error:', err);
+    return res.status(500).json({ error: 'Internal error' });
   }
 }
