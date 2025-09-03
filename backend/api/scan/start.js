@@ -10,16 +10,16 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }, // Neon needs SSL
 });
 
-/** ====== CORS ====== **/
-const FRONTEND_ORIGIN =
-  process.env.CORS_ORIGIN ||
-  process.env.FRONTEND_URL ||
-  process.env.WEB_URL ||
-  'https://atrbpn-dms.web.app';
+// ===== CORS (single origin by request) =====
+const RAW_ORIGINS =
+  process.env.CORS_ORIGIN || process.env.FRONTEND_URL || process.env.WEB_URL || 'https://atrbpn-dms.web.app';
 
-function setCors(res) {
-  // IMPORTANT: exactly one ACAO header (browser menolak kalau lebih dari satu)
-  res.setHeader('Access-Control-Allow-Origin', FRONTEND_ORIGIN);
+const ALLOWED_ORIGINS = RAW_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
+
+function setCors(req, res) {
+  const origin = req.headers.origin;
+  const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+  res.setHeader('Access-Control-Allow-Origin', allow);   // <— SATU nilai
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -196,24 +196,10 @@ async function handleStart(req, res) {
 
 /** ====== Main Handler (catch-all) ====== **/
 export default async function handler(req, res) {
-  setCors(res);
-
-  if (req.method === 'OPTIONS') {
-    // izinkan preflight untuk semua path di bawah /api/scan
-    res.statusCode = 204;
-    return res.end();
-  }
-
-  // path tanpa query
+  setCors(req, res);                          // <— pakai req, bukan setCors(res)
+  if (req.method === 'OPTIONS') return res.status(204).end();
   const path = (req.url || '').split('?')[0];
-
-  if (path === '/api/scan/start') {
-    return handleStart(req, res);
-  }
-  
-// di handler /scan/start
-if (!documentId) return res.status(400).json({ error: 'documentId missing' });
-
-  // (opsional) bisa tambahkan route lain: /api/scan/state/:id, /api/scan/finish
+  if (path === '/api/scan/start') return handleStart(req, res);
   return json(res, 404, { error: 'Not Found' });
 }
+
