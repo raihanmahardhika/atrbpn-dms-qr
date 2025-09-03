@@ -139,9 +139,9 @@ async function handleStart(req, res) {
 
       // Validasi processActivityId milik process yang sama
       const pa = await db.query(
-        "SELECT id, process_id FROM process_activities WHERE id = $1",
+        "SELECT id, process_id, name FROM process_activities WHERE id = $1",
         [processActivityId]
-      );
+        );
       if (pa.rowCount === 0) {
         return { ok: false, code: 400, error: "Invalid processActivityId" };
       }
@@ -167,11 +167,12 @@ async function handleStart(req, res) {
       }
 
       // Catat start activity (set id + start_time sekarang)
-      const newId = randomUUID();
-      const ins = await db.query(
-        "INSERT INTO activity_scans (id, document_id, process_activity_id, start_time) VALUES ($1, $2, $3, now()) RETURNING id",
-        [newId, documentId, processActivityId]
-      );
+     const newId = randomUUID();
+        const activityName = pa.rows[0].name || "Aktivitas";
+        const ins = await db.query(
+        "INSERT INTO activity_scans (id, document_id, process_activity_id, activity_name, start_time) VALUES ($1, $2, $3, $4, now()) RETURNING id",
+        [newId, documentId, processActivityId, activityName]
+        );
 
       // Update status dokumen
       await db.query("UPDATE documents SET status = 'IN_PROGRESS' WHERE id = $1", [documentId]);
