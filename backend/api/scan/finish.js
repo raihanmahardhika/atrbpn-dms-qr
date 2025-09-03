@@ -1,9 +1,12 @@
 ﻿// backend/api/scan/finish.js
-import * as DB from '../../src/db.js';
+// Samakan koneksi DB dengan start.js (pg Pool + SSL)
+import { Pool } from 'pg';
 
-const query =
-  (typeof DB.query === 'function' && DB.query) ||
-  (DB.default && typeof DB.default.query === 'function' && DB.default.query.bind(DB.default));
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+const q = async (sql, params) => (await pool.query(sql, params)).rows;
 
 /** ===== CORS (single-origin by request) ===== */
 const RAW_ORIGINS =
@@ -20,14 +23,11 @@ function setCors(req, res) {
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-/** ===== Body parser ===== */
+/** ===== Body parser (aman di Vercel) ===== */
 async function readJson(req) {
   if (req.body && typeof req.body === 'object') return req.body;
-  if (req.body && typeof req.body === 'string') {
-    try { return JSON.parse(req.body); } catch {}
-  }
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
+  if (req.body && typeof req.body === 'string') { try { return JSON.parse(req.body); } catch {} }
+  const chunks = []; for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString('utf8') || '';
   try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
 }
@@ -38,6 +38,9 @@ export default async function handler(req, res) {
   if (req.method !== 'POST')  return res.status(405).json({ error: 'Method not allowed' });
 
   const body = await readJson(req);
+  // Catatan:
+  //  - activityId bisa berarti process_activity_id ATAU activity_scans.id (ambigu)
+  //  - activityScanId = activity_scans.id (spesifik)
   const { documentId, activityId, activityScanId, decision } = body || {};
 
   if (!documentId && !activityId && !activityScanId) {
@@ -47,10 +50,14 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1) paling presisi: activityScanId langsung
+    // (opsional) debug untuk memastikan database sama
+    // const dbg = await q('select current_database() as db');
+    // console.log('finish db =', dbg?.[0]?.db);
+
+    // 1) Paling presisi: activityScanId
     let open = null;
     if (activityScanId) {
-      open = (await query(
+      open = (await q(
         `select s.*
            from activity_scans s
           where s.id = $1
@@ -60,9 +67,9 @@ export default async function handler(req, res) {
       ))?.[0];
     }
 
-    // 2) kalau ada docId & activityId, kencangkan filter
+    // 2) documentId + activityId (ketat)
     if (!open && documentId && activityId) {
-      open = (await query(
+      open = (await q(
         `select s.*
            from activity_scans s
           where s.document_id = $1
@@ -74,9 +81,9 @@ export default async function handler(req, res) {
       ))?.[0];
     }
 
-    // 3) fallback: docId saja (ambil open terakhir)
+    // 3) documentId saja (fallback)
     if (!open && documentId) {
-      open = (await query(
+      open = (await q(
         `select s.*
            from activity_scans s
           where s.document_id = $1
@@ -87,9 +94,9 @@ export default async function handler(req, res) {
       ))?.[0];
     }
 
-    // 4) fallback: activityId saja (ambigu → cocokkan ke PA id ATAU scan id)
+    // 4) activityId saja (fallback ambigu: PA id atau scan id)
     if (!open && activityId) {
-      open = (await query(
+      open = (await q(
         `select s.*
            from activity_scans s
           where (s.process_activity_id = $1 or s.id = $1)
@@ -104,8 +111,8 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: 'No active activity' });
     }
 
-    // Tutup activity & hitung durasi
-    const done = await query(
+    // Tutup activity & durasi
+    const done = await q(
       `update activity_scans
           set end_time = now(),
               duration_seconds = extract(epoch from (now() - start_time))::int
@@ -116,12 +123,9 @@ export default async function handler(req, res) {
     const docId = done?.[0]?.document_id;
 
     // Tentukan status dokumen berikutnya
-    const proc = (await query(
-      `select process_id from documents where id = $1`,
-      [docId]
-    ))?.[0];
+    const proc = (await q(`select process_id from documents where id = $1`, [docId]))?.[0];
 
-    const next = (await query(
+    const next = (await q(
       `select pa.id
          from process_activities pa
          left join activity_scans s
@@ -136,10 +140,7 @@ export default async function handler(req, res) {
       [docId, proc.process_id]
     ))?.[0];
 
-    await query(
-      `update documents set status = $2 where id = $1`,
-      [docId, next ? 'WAITING' : 'DONE']
-    );
+    await q(`update documents set status = $2 where id = $1`, [docId, next ? 'WAITING' : 'DONE']);
 
     return res.status(200).json({
       finished: true,
