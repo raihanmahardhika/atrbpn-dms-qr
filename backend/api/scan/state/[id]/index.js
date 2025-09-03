@@ -1,93 +1,121 @@
-﻿// Adaptor DB yang tahan segala bentuk export dari src/db.js
+﻿// backend/api/scan/state/[id]/index.js
 import * as DB from '../../../../src/db.js';
 
-function resolveQueryFn() {
-  // urutan prioritas: named export query → default.query → db.query → pool.query
+// --- DB adapter (works with many export shapes)
+function queryFn() {
   if (typeof DB.query === 'function') return DB.query;
   if (DB.default && typeof DB.default.query === 'function') return DB.default.query.bind(DB.default);
   if (DB.db && typeof DB.db.query === 'function') return DB.db.query.bind(DB.db);
   if (DB.pool && typeof DB.pool.query === 'function') return DB.pool.query.bind(DB.pool);
-  // beberapa proyek menamai execute
   if (typeof DB.execute === 'function') return DB.execute;
   return null;
 }
 
+// --- CORS util: allow a single origin from a whitelist
+const ORIGINS =
+  (process.env.CORS_ORIGIN || process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+function setCORS(req, res) {
+  const caller = req.headers.origin;
+  let allow = '*';
+  if (ORIGINS.length === 1) allow = ORIGINS[0];
+  else if (caller && ORIGINS.includes(caller)) allow = caller;
+  else if (ORIGINS.length > 0) allow = ORIGINS[0];
+
+  res.setHeader('Access-Control-Allow-Origin', allow);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+// --- Figure out the foreign key column name in activity_scans
+async function getScanActivityCol(q) {
+  const candidates = ['activity_id', 'process_activity_id', 'master_activity_id'];
+  const r = await q(
+    `select column_name
+       from information_schema.columns
+      where table_name = 'activity_scans'
+        and column_name = any($1::text[])`,
+    [candidates]
+  );
+  if (r.rows.length) return r.rows[0].column_name;
+  // sensible default
+  return 'activity_id';
+}
+
 export default async function handler(req, res) {
-  // CORS minimal
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    return res.status(204).end();
-  }
-  res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+  setCORS(req, res);
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  if (req.method !== 'GET') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
-  }
-
-  const q = resolveQueryFn();
+  const q = queryFn();
   if (!q) {
-    // beri pesan error yang jelas di log
-    console.error('DB adapter not found. Exports from src/db.js =', Object.keys(DB));
+    console.error('DB adapter not found. Exports =', Object.keys(DB));
     return res.status(500).json({ error: 'DB adapter not found' });
   }
 
-  const { id } = req.query; // UUID dokumen
+  const { id } = req.query; // document UUID
 
   try {
-    // 1) Ambil dokumen + nama proses
-    const docq = await q(
-      `SELECT d.*, p.name AS process_name
-         FROM documents d
-         LEFT JOIN processes p ON p.id = d.process_id
-        WHERE d.id = $1`,
+    const scanCol = await getScanActivityCol(q); // e.g. "process_activity_id"
+
+    // 1) document + process name + status (if any)
+    const docQ = await q(
+      `select d.*, p.name as process_name
+         from documents d
+         left join processes p on p.id = d.process_id
+        where d.id = $1`,
       [id]
     );
-    const document = docq.rows?.[0];
+    const document = docQ.rows?.[0];
     if (!document) return res.status(404).json({ error: 'Document not found' });
 
-    // 2) Aktivitas yang sedang berjalan (belum end_time)
-    const activeq = await q(
-      `SELECT s.*, pa.name AS activity_name,
+    // 2) current active activity (no end_time)
+    const activeQ = await q(
+      `select s.*,
+              pa.name as activity_name,
               pa.is_decision,
               pa.decision_accept_label,
-              pa.decision_reject_label
-         FROM activity_scans s
-         JOIN process_activities pa ON pa.id = s.activity_id
-        WHERE s.document_id = $1
-          AND s.end_time IS NULL
-        ORDER BY s.start_time DESC
-        LIMIT 1`,
+              pa.decision_reject_label,
+              s.${scanCol} as activity_id
+         from activity_scans s
+         join process_activities pa on pa.id = s.${scanCol}
+        where s.document_id = $1
+          and s.end_time is null
+        order by s.start_time desc
+        limit 1`,
       [id]
     );
-    const active = activeq.rows?.[0] || null;
+    const active = activeQ.rows?.[0] || null;
 
-    // 3) Aktivitas berikutnya = aktivitas proses yang belum punya baris selesai
-    const nextq = await q(
-      `SELECT pa.*
-         FROM process_activities pa
-         LEFT JOIN activity_scans s
-           ON s.activity_id = pa.id
-          AND s.document_id = $1
-          AND s.end_time IS NOT NULL
-        WHERE pa.process_id = $2
-        GROUP BY pa.id
-        HAVING COUNT(s.id) = 0
-        ORDER BY pa.order_no ASC
-        LIMIT 1`,
+    // 3) next activity (first that has no completed row)
+    const nextQ = await q(
+      `select pa.*
+         from process_activities pa
+         left join activity_scans s
+           on s.${scanCol} = pa.id
+          and s.document_id = $1
+          and s.end_time is not null
+        where pa.process_id = $2
+        group by pa.id
+        having count(s.id) = 0
+        order by pa.order_no asc
+        limit 1`,
       [id, document.process_id]
     );
-    const next = nextq.rows?.[0] || null;
+    const next = nextQ.rows?.[0] || null;
 
-    // 4) waitingNow = detik sejak end_time terakhir
+    // 4) waiting seconds since last completed activity
     const lastDoneQ = await q(
-      `SELECT end_time
-         FROM activity_scans
-        WHERE document_id = $1
-          AND end_time IS NOT NULL
-        ORDER BY end_time DESC
-        LIMIT 1`,
+      `select end_time
+         from activity_scans
+        where document_id = $1
+          and end_time is not null
+        order by end_time desc
+        limit 1`,
       [id]
     );
     let waitingNow = 0;
@@ -98,7 +126,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // 5) Status dokumen (pakai kolom documents.status bila ada, jika kosong → infer)
+    // 5) status
     let status = document.status;
     if (!status) {
       if (active) status = 'IN_PROGRESS';
@@ -106,7 +134,6 @@ export default async function handler(req, res) {
       else status = 'DONE';
     }
 
-    // 6) Response untuk frontend
     return res.status(200).json({
       document: {
         id: document.id,
