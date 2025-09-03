@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useParams, useLocation } from "react-router-dom";
 import './app.css';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 
@@ -505,10 +506,13 @@ function Guest({ goBack, initialDocumentId }) {
     if (!state?.document?.id) return;
     setLoading(true);
     try {
-      await apiPost("/scan/start", { documentId: state.document.id }); // terima dokumen
-      await fetchState(state.document.id); // status -> WAITING
+      await apiPost('/scan/start', {
+        documentId: state.document.id,
+        acceptOnly: true,          // <- penting untuk beda dari "Mulai"
+      });
+      await fetchState(state.document.id);    // status -> WAITING
     } catch (e) {
-      alert(e.message || "Gagal menerima dokumen");
+      alert(e.message || 'Gagal menerima dokumen');
     } finally {
       setLoading(false);
     }
@@ -534,18 +538,22 @@ function Guest({ goBack, initialDocumentId }) {
 
   async function finishCurrent(decision) {
     if (!state?.document?.id) return;
+
+    // kalau ada current activity: kirim activityId
+    // kalau tidak (mis. fallback), kirim documentId
     const body = state?.state?.current?.id
       ? { activityId: state.state.current.id }
       : { documentId: state.document.id };
-    if (decision) body.decision = decision;
+
+    if (decision) body.decision = decision; // 'accept' atau 'reject'
 
     setLoading(true);
     try {
-      const r = await apiPost("/scan/finish", body);
-      // backend akan set status: WAITING (jika ada next) atau DONE
+      const r = await apiPost('/scan/finish', body);
+      // backend akan set status: WAITING (kalau ada next) atau DONE (jika selesai)
       await fetchState(state.document.id);
     } catch (e) {
-      alert(e.message || "Gagal selesai");
+      alert(e.message || 'Gagal selesai');
     } finally {
       setLoading(false);
     }
@@ -595,45 +603,55 @@ function Guest({ goBack, initialDocumentId }) {
 
             {/* C1: OPEN → Terima Dokumen */}
             {showReception && (
-              <button onClick={acceptDocument}>Terima Dokumen</button>
+              <div className="card">
+                <button onClick={acceptDocument}>Terima Dokumen</button>
+              </div>
             )}
 
-            {/* C2: WAITING → tampilkan Proses berikutnya + Mulai */}
             {showStart && (
-              <>
-                <div className="small" style={{ marginBottom: 8 }}>
-                  Proses berikutnya: <b>{next?.name || "-"}</b>
-                </div>
-                <button onClick={startNext}>Mulai</button>
-              </>
+              <div className="card">
+                <div className="small">Proses berikutnya: <b>{state.state.next?.name || '-'}</b></div>
+                <button onClick={async () => {
+                  setLoading(true);
+                  try {
+                    await apiPost('/scan/start', {
+                      documentId: state.document.id,
+                      processActivityId: state.state.next.id
+                    });
+                    await fetchState(state.document.id);
+                  } finally { setLoading(false); }
+                }}>
+                  Mulai
+                </button>
+              </div>
             )}
 
-            {/* C3: IN_PROGRESS → Sedang dikerjakan + Selesai/Decision */}
             {showWorking && (
-              <>
-                <div className="small" style={{ marginBottom: 8 }}>
-                  Sedang dikerjakan: <b>{cur?.name || cur?.activity_name || "-"}</b>
-                </div>
-                {cur?.is_decision ? (
-                  <div className="flex">
-                    <button onClick={() => finishCurrent("accept")}>
-                      {cur.decision_accept_label || "Lanjut"}
-                    </button>
-                    <button className="secondary" onClick={() => finishCurrent("reject")}>
-                      {cur.decision_reject_label || "Tolak"}
-                    </button>
+                <>
+                  <div className="small" style={{ marginBottom: 8 }}>
+                    Sedang dikerjakan: <b>{state.state.current?.name || state.state.current?.activity_name || '-'}</b>
                   </div>
-                ) : (
-                  <button className="secondary" onClick={() => finishCurrent()}>
-                    Selesai
-                  </button>
-                )}
-              </>
-            )}
+                  {state.state.current?.is_decision ? (
+                    <div className="flex">
+                      <button onClick={() => finishCurrent('accept')}>
+                        {state.state.current.decision_accept_label || 'Lanjut'}
+                      </button>
+                      <button className="secondary" onClick={() => finishCurrent('reject')}>
+                        {state.state.current.decision_reject_label || 'Tolak'}
+                      </button>
+                    </div>
+                  ) : (
+                    <button className="secondary" onClick={() => finishCurrent()}>
+                      Selesai
+                    </button>
+                  )}
+                </>
+              )}
 
-            {/* C4: DONE → selesai tanpa tombol lain */}
             {showDone && (
-              <div className="small"><b>Proses selesai.</b> Tidak ada proses lanjutan.</div>
+              <div className="card">
+                <div className="small"><b>Proses selesai.</b> Tidak ada proses lanjutan.</div>
+              </div>
             )}
           </div>
         )}

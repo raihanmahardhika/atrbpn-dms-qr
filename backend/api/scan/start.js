@@ -1,89 +1,219 @@
-﻿// backend/api/scan/start.js
-import * as DB from '../../src/db.js';
+﻿// backend/api/scan/[...all].js
+// Node.js 22 on Vercel (ESM)
+// npm i pg
 
-// Works whether you export {query} or default.query from src/db.js
-const query =
-  (typeof DB.query === 'function' && DB.query) ||
-  (DB.default && typeof DB.default.query === 'function' && DB.default.query.bind(DB.default));
+import { Pool } from 'pg';
 
-function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN?.split(',')[0] || '*');
+/** ====== DB POOL (Neon) ====== **/
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // Neon needs SSL
+});
+
+/** ====== CORS ====== **/
+const FRONTEND_ORIGIN =
+  process.env.CORS_ORIGIN ||
+  process.env.FRONTEND_URL ||
+  process.env.WEB_URL ||
+  'https://atrbpn-dms.web.app';
+
+function setCors(res) {
+  // IMPORTANT: exactly one ACAO header (browser menolak kalau lebih dari satu)
+  res.setHeader('Access-Control-Allow-Origin', FRONTEND_ORIGIN);
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
 }
 
+/** ====== Body Parser (fallback safe) ====== **/
+async function readJson(req) {
+  // Di Vercel (Node), req.body biasanya sudah ter-parse untuk JSON
+  if (req.body && typeof req.body === 'object') return req.body;
+  if (req.body && typeof req.body === 'string') {
+    try { return JSON.parse(req.body); } catch { /* fallthrough */ }
+  }
+  // Fallback: manual read (kalau body belum di-parse)
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString('utf8') || '';
+  try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
+}
+
+/** ====== Helpers ====== **/
+function json(res, code, payload) {
+  res.statusCode = code;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(payload));
+}
+
+async function runTx(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/** ====== Core Logic: /api/scan/start ====== **/
+async function handleStart(req, res) {
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204; // no content
+    return res.end();
+  }
+  if (req.method !== 'POST') {
+    return json(res, 405, { error: 'Method Not Allowed' });
+  }
+
+  const body = await readJson(req);
+  const { acceptOnly, documentId, processActivityId } = body || {};
+
+  // Validasi dasar
+  if (!documentId) {
+    return json(res, 400, { error: 'documentId missing' });
+  }
+
+  try {
+    if (acceptOnly === true) {
+      // Mode 1: Terima Dokumen (OPEN -> WAITING)
+      const result = await runTx(async (db) => {
+        const doc = await db.query(
+          'SELECT id, status FROM documents WHERE id = $1',
+          [documentId]
+        );
+        if (doc.rowCount === 0) {
+          return { ok: false, code: 404, error: 'Document not found' };
+        }
+        const cur = doc.rows[0];
+        if (cur.status !== 'OPEN') {
+          return {
+            ok: false,
+            code: 409,
+            error: 'Invalid state transition: only OPEN can be accepted',
+            currentStatus: cur.status,
+          };
+        }
+        const upd = await db.query(
+          "UPDATE documents SET status = 'WAITING' WHERE id = $1 RETURNING id, status",
+          [documentId]
+        );
+        return { ok: true, document: upd.rows[0] };
+      });
+
+      if (!result.ok) return json(res, result.code, result);
+      return json(res, 200, { ok: true, ...result });
+    }
+
+    // Mode 2: Mulai Proses (WAITING -> IN_PROGRESS)
+    if (!processActivityId) {
+      return json(res, 400, { error: 'processActivityId missing' });
+    }
+
+    const result = await runTx(async (db) => {
+      // Ambil dokumen
+      const doc = await db.query(
+        'SELECT id, status, process_id FROM documents WHERE id = $1',
+        [documentId]
+      );
+      if (doc.rowCount === 0) {
+        return { ok: false, code: 404, error: 'Document not found' };
+      }
+      const d = doc.rows[0];
+
+      if (d.status !== 'WAITING') {
+        return {
+          ok: false,
+          code: 409,
+          error: 'Document must be in WAITING to start next activity',
+          currentStatus: d.status,
+        };
+      }
+
+      // Validasi processActivityId milik process yang sama
+      const pa = await db.query(
+        'SELECT id, process_id FROM process_activities WHERE id = $1',
+        [processActivityId]
+      );
+      if (pa.rowCount === 0) {
+        return { ok: false, code: 400, error: 'Invalid processActivityId' };
+      }
+      if (pa.rows[0].process_id !== d.process_id) {
+        return {
+          ok: false,
+          code: 400,
+          error: 'processActivity does not belong to the document process',
+        };
+      }
+
+      // Pastikan tidak ada activity yang sedang berjalan (optional guard)
+      const running = await db.query(
+        // Jangan gunakan kolom yang tidak ada (mis. created_at)
+        // Asumsi schema punya finished_at NULL untuk yang masih berjalan.
+        'SELECT id FROM activity_scans WHERE document_id = $1 AND finished_at IS NULL LIMIT 1',
+        [documentId]
+      );
+      if (running.rowCount > 0) {
+        return {
+          ok: false,
+          code: 409,
+          error: 'An activity is already in progress for this document',
+        };
+      }
+
+      // Catat start activity (hindari kolom timestamp kalau tidak yakin ada defaultnya)
+      const ins = await db.query(
+        'INSERT INTO activity_scans (document_id, process_activity_id) VALUES ($1, $2) RETURNING id',
+        [documentId, processActivityId]
+      );
+
+      // Update status dokumen
+      await db.query(
+        "UPDATE documents SET status = 'IN_PROGRESS' WHERE id = $1",
+        [documentId]
+      );
+
+      return {
+        ok: true,
+        activityScanId: ins.rows[0].id,
+        newStatus: 'IN_PROGRESS',
+      };
+    });
+
+    if (!result.ok) return json(res, result.code, result);
+    return json(res, 200, { ok: true, ...result });
+  } catch (err) {
+    console.error('start error', err);
+    return json(res, 500, { error: 'Internal Server Error' });
+  }
+}
+
+/** ====== Main Handler (catch-all) ====== **/
 export default async function handler(req, res) {
-  if (req.method === 'OPTIONS') { cors(res); return res.status(204).end(); }
-  if (req.method !== 'POST')  { cors(res); return res.status(405).json({ error: 'Method not allowed' }); }
-  cors(res);
+  setCors(res);
 
-  const { documentId, processActivityId, acceptOnly } = req.body || {};
-  if (!documentId) return res.status(400).json({ error: 'documentId is required' });
-
-  // Fetch document
-  const docRows = await query(`select id, process_id, status from documents where id = $1`, [documentId]);
-  const doc = docRows?.[0];
-  if (!doc) return res.status(404).json({ error: 'Document not found' });
-
-  // Only "Terima Dokumen" — mark as WAITING and exit
-  if (acceptOnly) {
-    await query(`update documents set status = 'WAITING' where id = $1`, [documentId]);
-    return res.status(200).json({ initialized: true, status: 'WAITING' });
+  if (req.method === 'OPTIONS') {
+    // izinkan preflight untuk semua path di bawah /api/scan
+    res.statusCode = 204;
+    return res.end();
   }
 
-  // Don’t start if there’s still an open scan row
-  const hasActive = (await query(
-    `select id from activity_scans where document_id = $1 and end_time is null limit 1`,
-    [documentId]
-  ))[0];
-  if (hasActive) return res.status(409).json({ error: 'There is an active activity' });
+  // path tanpa query
+  const path = (req.url || '').split('?')[0];
 
-  // Decide which activity to start
-  let act = null;
-
-  if (processActivityId) {
-    act = (await query(
-      `select id, name, order_no from process_activities where id = $1`,
-      [processActivityId]
-    ))[0];
-  } else {
-    // Start the very first not-yet-completed activity (by order_no)
-    act = (await query(
-      `select pa.id, pa.name, pa.order_no
-         from process_activities pa
-         left join activity_scans s
-           on s.process_activity_id = pa.id
-          and s.document_id = $1
-          and s.end_time is not null
-        where pa.process_id = $2
-        group by pa.id
-        having count(s.id) = 0
-        order by pa.order_no asc
-        limit 1`,
-      [documentId, doc.process_id]
-    ))[0];
+  if (path === '/api/scan/start') {
+    return handleStart(req, res);
   }
+  
+// di handler /scan/start
+if (!documentId) return res.status(400).json({ error: 'documentId missing' });
 
-  if (!act) return res.status(400).json({ error: 'No next activity to start' });
-
-  // Insert into activity_scans (NO created_at in your table)
-  await query(
-    `insert into activity_scans
-       (document_id, process_activity_id, activity_name, start_time,
-        waiting_seconds, duration_seconds, resting_seconds, next_activity_id)
-     values ($1, $2, $3, now(), 0, 0, 0, null)`,
-    [documentId, act.id, act.name]
-  );
-
-  // Put document into IN_PROGRESS
-  await query(`update documents set status = 'IN_PROGRESS' where id = $1`, [documentId]);
-
-  return res.status(200).json({
-    started: true,
-    activity: { id: act.id, name: act.name },
-    startTime: new Date().toISOString(),
-    waitingSeconds: 0,
-    restingSeconds: 0
-  });
+  // (opsional) bisa tambahkan route lain: /api/scan/state/:id, /api/scan/finish
+  return json(res, 404, { error: 'Not Found' });
 }
