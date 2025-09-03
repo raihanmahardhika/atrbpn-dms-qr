@@ -109,7 +109,7 @@ export default async function handler(req, res) {
     const durationSeconds = Math.max(0, Math.floor((Date.now() - startTs) / 1000));
 
     await client.query(
-      `UPDATE scans
+      `UPDATE activity_scans
        SET end_time = NOW(), duration_seconds = $1
        WHERE id = $2`,
       [durationSeconds, running.id]

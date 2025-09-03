@@ -145,7 +145,7 @@ export default async function handler(req, res) {
 
     // Mulai activity
     await client.query(
-      `INSERT INTO scans (document_id, activity_id, start_time, waiting_seconds, resting_seconds)
+      `INSERT INTO activity_scans (document_id, activity_id, start_time, waiting_seconds, resting_seconds)
        VALUES ($1, $2, NOW(), $3, 0)`,
       [documentId, actId, waitingSeconds]
     );
