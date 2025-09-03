@@ -1,8 +1,19 @@
-﻿// gunakan pola import yang sama seperti di start.js / finish.js
-import db from '../../../../src/db.js'; // <— default export, bukan { pool }
+﻿// Adaptor DB yang tahan segala bentuk export dari src/db.js
+import * as DB from '../../../../src/db.js';
+
+function resolveQueryFn() {
+  // urutan prioritas: named export query → default.query → db.query → pool.query
+  if (typeof DB.query === 'function') return DB.query;
+  if (DB.default && typeof DB.default.query === 'function') return DB.default.query.bind(DB.default);
+  if (DB.db && typeof DB.db.query === 'function') return DB.db.query.bind(DB.db);
+  if (DB.pool && typeof DB.pool.query === 'function') return DB.pool.query.bind(DB.pool);
+  // beberapa proyek menamai execute
+  if (typeof DB.execute === 'function') return DB.execute;
+  return null;
+}
 
 export default async function handler(req, res) {
-  // CORS minimal (aman walau ada middleware lain)
+  // CORS minimal
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -15,22 +26,29 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
+  const q = resolveQueryFn();
+  if (!q) {
+    // beri pesan error yang jelas di log
+    console.error('DB adapter not found. Exports from src/db.js =', Object.keys(DB));
+    return res.status(500).json({ error: 'DB adapter not found' });
+  }
+
   const { id } = req.query; // UUID dokumen
 
   try {
-    // 1) Dokumen + nama proses
-    const docq = await db.query(
+    // 1) Ambil dokumen + nama proses
+    const docq = await q(
       `SELECT d.*, p.name AS process_name
          FROM documents d
          LEFT JOIN processes p ON p.id = d.process_id
         WHERE d.id = $1`,
       [id]
     );
-    const document = docq.rows[0];
+    const document = docq.rows?.[0];
     if (!document) return res.status(404).json({ error: 'Document not found' });
 
-    // 2) Activity yang sedang berjalan (belum end_time)
-    const activeq = await db.query(
+    // 2) Aktivitas yang sedang berjalan (belum end_time)
+    const activeq = await q(
       `SELECT s.*, pa.name AS activity_name,
               pa.is_decision,
               pa.decision_accept_label,
@@ -43,10 +61,10 @@ export default async function handler(req, res) {
         LIMIT 1`,
       [id]
     );
-    const active = activeq.rows[0] || null;
+    const active = activeq.rows?.[0] || null;
 
-    // 3) Aktivitas berikutnya = aktivitas proses yang belum punya baris SELESAI
-    const nextq = await db.query(
+    // 3) Aktivitas berikutnya = aktivitas proses yang belum punya baris selesai
+    const nextq = await q(
       `SELECT pa.*
          FROM process_activities pa
          LEFT JOIN activity_scans s
@@ -60,10 +78,10 @@ export default async function handler(req, res) {
         LIMIT 1`,
       [id, document.process_id]
     );
-    const next = nextq.rows[0] || null;
+    const next = nextq.rows?.[0] || null;
 
-    // 4) waitingNow = sejak end_time terakhir
-    const lastDoneQ = await db.query(
+    // 4) waitingNow = detik sejak end_time terakhir
+    const lastDoneQ = await q(
       `SELECT end_time
          FROM activity_scans
         WHERE document_id = $1
@@ -73,14 +91,14 @@ export default async function handler(req, res) {
       [id]
     );
     let waitingNow = 0;
-    if (lastDoneQ.rows[0]?.end_time) {
+    if (lastDoneQ.rows?.[0]?.end_time) {
       waitingNow = Math.max(
         0,
         Math.floor((Date.now() - new Date(lastDoneQ.rows[0].end_time).getTime()) / 1000)
       );
     }
 
-    // 5) Status dari kolom documents.status (fallback infer)
+    // 5) Status dokumen (pakai kolom documents.status bila ada, jika kosong → infer)
     let status = document.status;
     if (!status) {
       if (active) status = 'IN_PROGRESS';
@@ -88,7 +106,7 @@ export default async function handler(req, res) {
       else status = 'DONE';
     }
 
-    // 6) Payload untuk frontend
+    // 6) Response untuk frontend
     return res.status(200).json({
       document: {
         id: document.id,
