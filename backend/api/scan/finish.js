@@ -13,7 +13,7 @@ const ALLOWED_ORIGINS = RAW_ORIGINS.split(',').map(s => s.trim()).filter(Boolean
 function setCors(req, res) {
   const origin = req.headers.origin;
   const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-  res.setHeader('Access-Control-Allow-Origin', allow); // SATU nilai
+  res.setHeader('Access-Control-Allow-Origin', allow);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -38,21 +38,26 @@ export default async function handler(req, res) {
   if (req.method !== 'POST')  return res.status(405).json({ error: 'Method not allowed' });
 
   const body = await readJson(req);
-  // Catat: activityId di sini = process_activity_id (bukan scan id)
+  // Catatan:
+  // - activityId (AMBIGU): bisa process_activity_id ATAU activity_scans.id
+  // - activityScanId (spesifik): activity_scans.id
   const { documentId, activityId, activityScanId, decision } = body || {};
+
   if (!documentId && !activityId && !activityScanId) {
-    return res.status(400).json({ error: 'documentId or activityId (process_activity_id) or activityScanId is required' });
+    return res.status(400).json({
+      error: 'documentId or activityId (process_activity_id OR scan id) or activityScanId is required'
+    });
   }
 
   try {
-    // Cari activity scan yang MASIH TERBUKA (end_time IS NULL).
-    // Perbaiki precedence: seluruh (docId OR processActivityId OR scanId) dibungkus, lalu AND end_time IS NULL.
+    // Cari activity scan yang MASIH TERBUKA (end_time IS NULL)
+    // Terapkan AND ke seluruh grup; activityId diasumsikan ambigu.
     const open = (await query(
       `select s.*
          from activity_scans s
         where (
                ($1::uuid is not null and s.document_id = $1)
-            or ($2::uuid is not null and s.process_activity_id = $2)
+            or ($2::uuid is not null and (s.process_activity_id = $2 or s.id = $2))
             or ($3::uuid is not null and s.id = $3)
         )
           and s.end_time is null
@@ -74,9 +79,8 @@ export default async function handler(req, res) {
     );
     const docId = done?.[0]?.document_id;
 
-    // Cek apakah masih ada aktivitas berikutnya yang BELUM selesai
-    // Catatan: di skema-mu field urutan bisa 'order_index' atau 'order_no'.
-    // Ganti ke yang benar di DB-mu. Di banyak bagian kamu pakai order_index.
+    // Tentukan apakah masih ada aktivitas berikutnya yang belum selesai
+    // (gunakan kolom urutan yang dipakai skema kamu: order_index)
     const proc = (await query(`select process_id from documents where id = $1`, [docId]))?.[0];
 
     const next = (await query(
