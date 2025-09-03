@@ -1,8 +1,8 @@
-﻿// backend/api/scan/state/[id]/index.js
-import { pool } from '../../../../src/db.js'; // sesuaikan bila nama/ekspor helper berbeda
+﻿// gunakan pola import yang sama seperti di start.js / finish.js
+import db from '../../../../src/db.js'; // <— default export, bukan { pool }
 
 export default async function handler(req, res) {
-  // Minimal CORS guard (aman walau kamu juga punya catch-all di tempat lain)
+  // CORS minimal (aman walau ada middleware lain)
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -15,11 +15,11 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  const { id } = req.query; // document id (UUID)
+  const { id } = req.query; // UUID dokumen
 
   try {
-    // 1) Ambil dokumen + nama proses
-    const docq = await pool.query(
+    // 1) Dokumen + nama proses
+    const docq = await db.query(
       `SELECT d.*, p.name AS process_name
          FROM documents d
          LEFT JOIN processes p ON p.id = d.process_id
@@ -27,12 +27,10 @@ export default async function handler(req, res) {
       [id]
     );
     const document = docq.rows[0];
-    if (!document) {
-      return res.status(404).json({ error: 'Document not found' });
-    }
+    if (!document) return res.status(404).json({ error: 'Document not found' });
 
-    // 2) Cari activity scan yang AKTIF (belum ditutup)
-    const activeq = await pool.query(
+    // 2) Activity yang sedang berjalan (belum end_time)
+    const activeq = await db.query(
       `SELECT s.*, pa.name AS activity_name,
               pa.is_decision,
               pa.decision_accept_label,
@@ -47,8 +45,8 @@ export default async function handler(req, res) {
     );
     const active = activeq.rows[0] || null;
 
-    // 3) Cari aktivitas berikutnya (yang belum pernah SELESAI untuk dokumen ini)
-    const nextq = await pool.query(
+    // 3) Aktivitas berikutnya = aktivitas proses yang belum punya baris SELESAI
+    const nextq = await db.query(
       `SELECT pa.*
          FROM process_activities pa
          LEFT JOIN activity_scans s
@@ -64,8 +62,8 @@ export default async function handler(req, res) {
     );
     const next = nextq.rows[0] || null;
 
-    // 4) Hitung waitingNow (sejak scan selesai terakhir)
-    const lastDoneQ = await pool.query(
+    // 4) waitingNow = sejak end_time terakhir
+    const lastDoneQ = await db.query(
       `SELECT end_time
          FROM activity_scans
         WHERE document_id = $1
@@ -82,17 +80,16 @@ export default async function handler(req, res) {
       );
     }
 
-    // 5) Tentukan status dari kolom documents.status bila ada,
-    //    kalau null → infer dari kondisi activity_scans.
-    let status = document.status; // OPEN | WAITING | IN_PROGRESS | DONE (sesuai migrasi kita)
+    // 5) Status dari kolom documents.status (fallback infer)
+    let status = document.status;
     if (!status) {
       if (active) status = 'IN_PROGRESS';
       else if (next) status = 'WAITING';
       else status = 'DONE';
     }
 
-    // 6) Bentuk payload seperti yang diharapkan frontend
-    const payload = {
+    // 6) Payload untuk frontend
+    return res.status(200).json({
       document: {
         id: document.id,
         doc_type: document.doc_type,
@@ -125,9 +122,7 @@ export default async function handler(req, res) {
       },
       waitingNow,
       restingNow: 0
-    };
-
-    return res.status(200).json(payload);
+    });
   } catch (err) {
     console.error('scan/state error:', err);
     return res.status(500).json({ error: 'Internal error' });
