@@ -1,7 +1,5 @@
-﻿// backend/api/scan/[...all].js
+﻿// backend/api/scan/start.js
 // Node.js 22 on Vercel (ESM)
-// npm i pg
-
 import { Pool } from 'pg';
 
 /** ====== DB POOL (Neon) ====== **/
@@ -10,16 +8,19 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }, // Neon needs SSL
 });
 
-// ===== CORS (single origin by request) =====
+/** ====== CORS (single-origin by request) ====== **/
 const RAW_ORIGINS =
-  process.env.CORS_ORIGIN || process.env.FRONTEND_URL || process.env.WEB_URL || 'https://atrbpn-dms.web.app';
+  process.env.CORS_ORIGIN ||
+  process.env.FRONTEND_URL ||
+  process.env.WEB_URL ||
+  'https://atrbpn-dms.web.app';
 
 const ALLOWED_ORIGINS = RAW_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
 
 function setCors(req, res) {
   const origin = req.headers.origin;
   const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-  res.setHeader('Access-Control-Allow-Origin', allow);   // <— SATU nilai
+  res.setHeader('Access-Control-Allow-Origin', allow); // satu nilai saja
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -28,14 +29,12 @@ function setCors(req, res) {
 
 /** ====== Body Parser (fallback safe) ====== **/
 async function readJson(req) {
-  // Di Vercel (Node), req.body biasanya sudah ter-parse untuk JSON
   if (req.body && typeof req.body === 'object') return req.body;
   if (req.body && typeof req.body === 'string') {
-    try { return JSON.parse(req.body); } catch { /* fallthrough */ }
+    try { return JSON.parse(req.body); } catch {}
   }
-  // Fallback: manual read (kalau body belum di-parse)
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString('utf8') || '';
   try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
 }
@@ -64,41 +63,23 @@ async function runTx(fn) {
 
 /** ====== Core Logic: /api/scan/start ====== **/
 async function handleStart(req, res) {
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 204; // no content
-    return res.end();
-  }
-  if (req.method !== 'POST') {
-    return json(res, 405, { error: 'Method Not Allowed' });
-  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST')    return json(res, 405, { error: 'Method Not Allowed' });
 
   const body = await readJson(req);
   const { acceptOnly, documentId, processActivityId } = body || {};
 
-  // Validasi dasar
-  if (!documentId) {
-    return json(res, 400, { error: 'documentId missing' });
-  }
+  if (!documentId) return json(res, 400, { error: 'documentId missing' });
 
   try {
     if (acceptOnly === true) {
       // Mode 1: Terima Dokumen (OPEN -> WAITING)
       const result = await runTx(async (db) => {
-        const doc = await db.query(
-          'SELECT id, status FROM documents WHERE id = $1',
-          [documentId]
-        );
-        if (doc.rowCount === 0) {
-          return { ok: false, code: 404, error: 'Document not found' };
-        }
+        const doc = await db.query('SELECT id, status FROM documents WHERE id = $1', [documentId]);
+        if (doc.rowCount === 0) return { ok: false, code: 404, error: 'Document not found' };
         const cur = doc.rows[0];
         if (cur.status !== 'OPEN') {
-          return {
-            ok: false,
-            code: 409,
-            error: 'Invalid state transition: only OPEN can be accepted',
-            currentStatus: cur.status,
-          };
+          return { ok: false, code: 409, error: 'Invalid state transition: only OPEN can be accepted', currentStatus: cur.status };
         }
         const upd = await db.query(
           "UPDATE documents SET status = 'WAITING' WHERE id = $1 RETURNING id, status",
@@ -112,9 +93,7 @@ async function handleStart(req, res) {
     }
 
     // Mode 2: Mulai Proses (WAITING -> IN_PROGRESS)
-    if (!processActivityId) {
-      return json(res, 400, { error: 'processActivityId missing' });
-    }
+    if (!processActivityId) return json(res, 400, { error: 'processActivityId missing' });
 
     const result = await runTx(async (db) => {
       // Ambil dokumen
@@ -122,68 +101,39 @@ async function handleStart(req, res) {
         'SELECT id, status, process_id FROM documents WHERE id = $1',
         [documentId]
       );
-      if (doc.rowCount === 0) {
-        return { ok: false, code: 404, error: 'Document not found' };
-      }
+      if (doc.rowCount === 0)   return { ok: false, code: 404, error: 'Document not found' };
       const d = doc.rows[0];
 
       if (d.status !== 'WAITING') {
-        return {
-          ok: false,
-          code: 409,
-          error: 'Document must be in WAITING to start next activity',
-          currentStatus: d.status,
-        };
+        return { ok: false, code: 409, error: 'Document must be in WAITING to start next activity', currentStatus: d.status };
       }
 
-      // Validasi processActivityId milik process yang sama
-      const pa = await db.query(
-        'SELECT id, process_id FROM process_activities WHERE id = $1',
-        [processActivityId]
-      );
-      if (pa.rowCount === 0) {
-        return { ok: false, code: 400, error: 'Invalid processActivityId' };
-      }
+      // Validasi PA milik process yang sama
+      const pa = await db.query('SELECT id, process_id FROM process_activities WHERE id = $1', [processActivityId]);
+      if (pa.rowCount === 0)    return { ok: false, code: 400, error: 'Invalid processActivityId' };
       if (pa.rows[0].process_id !== d.process_id) {
-        return {
-          ok: false,
-          code: 400,
-          error: 'processActivity does not belong to the document process',
-        };
+        return { ok: false, code: 400, error: 'processActivity does not belong to the document process' };
       }
 
-      // Pastikan tidak ada activity yang sedang berjalan (optional guard)
+      // Cek tidak ada activity lain yang masih berjalan
       const running = await db.query(
-        // Jangan gunakan kolom yang tidak ada (mis. created_at)
-        // Asumsi schema punya finished_at NULL untuk yang masih berjalan.
-        'SELECT id FROM activity_scans WHERE document_id = $1 AND end_time IS NULL LIMIT 1 ',
+        'SELECT id FROM activity_scans WHERE document_id = $1 AND end_time IS NULL LIMIT 1', // <— fixed
         [documentId]
       );
       if (running.rowCount > 0) {
-        return {
-          ok: false,
-          code: 409,
-          error: 'An activity is already in progress for this document',
-        };
+        return { ok: false, code: 409, error: 'An activity is already in progress for this document' };
       }
 
-      // Catat start activity (hindari kolom timestamp kalau tidak yakin ada defaultnya)
+      // Catat mulai aktivitas (set start_time sekarang)
       const ins = await db.query(
-        'INSERT INTO activity_scans (document_id, process_activity_id, start_time) VALUES ($1, $2, now()) RETURNING id',
+        'INSERT INTO activity_scans (document_id, process_activity_id, start_time) VALUES ($1, $2, now()) RETURNING id', // <— start_time explicit
         [documentId, processActivityId]
       );
 
       // Update status dokumen
-      await db.query(
-        "UPDATE documents SET status = 'IN_PROGRESS' WHERE id = $1",
-        [documentId]
-      );
+      await db.query("UPDATE documents SET status = 'IN_PROGRESS' WHERE id = $1", [documentId]);
 
-      return {
-        ok: true,
-        activityScanId: ins.rows[0].id,
-        newStatus: 'IN_PROGRESS',
-      };
+      return { ok: true, activityScanId: ins.rows[0].id, newStatus: 'IN_PROGRESS' };
     });
 
     if (!result.ok) return json(res, result.code, result);
@@ -194,12 +144,8 @@ async function handleStart(req, res) {
   }
 }
 
-/** ====== Main Handler (catch-all) ====== **/
+/** ====== Route handler (this file maps to /api/scan/start) ====== **/
 export default async function handler(req, res) {
-  setCors(req, res);                          // <— pakai req, bukan setCors(res)
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  const path = (req.url || '').split('?')[0];
-  if (path === '/api/scan/start') return handleStart(req, res);
-  return json(res, 404, { error: 'Not Found' });
+  setCors(req, res);
+  return handleStart(req, res);
 }
-
