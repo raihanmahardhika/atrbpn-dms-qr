@@ -537,27 +537,26 @@ function Guest({ goBack, initialDocumentId }) {
   }
 
   async function finishCurrent(decision) {
-    if (!state?.document?.id) return;
+  if (!state?.document?.id) return;
+  const body = { documentId: state.document.id };
 
-    // kalau ada current activity: kirim activityId
-    // kalau tidak (mis. fallback), kirim documentId
-    const body = state?.state?.current?.id
-      ? { activityId: state.state.current.id }
-      : { documentId: state.document.id };
+  // kirim yang ada: id aktivitas (master) dan/atau id baris scan
+  if (state?.state?.current?.id) body.activityId = state.state.current.id;
+  if (state?.state?.current?.scan_id) body.activityScanId = state.state.current.scan_id;
 
-    if (decision) body.decision = decision; // 'accept' atau 'reject'
+  if (decision) body.decision = decision;
 
-    setLoading(true);
-    try {
-      const r = await apiPost('/scan/finish', body);
-      // backend akan set status: WAITING (kalau ada next) atau DONE (jika selesai)
-      await fetchState(state.document.id);
-    } catch (e) {
-      alert(e.message || 'Gagal selesai');
-    } finally {
-      setLoading(false);
-    }
+  setLoading(true);
+  try {
+    await apiPost('/scan/finish', body);
+    await fetchState(state.document.id);
+  } catch (e) {
+    alert(e.message || 'Gagal selesai');
+  } finally {
+    setLoading(false);
   }
+}
+
 
   // Derive tampilan dari status dokumen
   const s = state?.document?.status; // 'OPEN' | 'WAITING' | 'IN_PROGRESS' | 'DONE'

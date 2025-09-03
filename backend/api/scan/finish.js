@@ -20,7 +20,7 @@ function setCors(req, res) {
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-/** ===== Body parser (aman di Vercel) ===== */
+/** ===== Body parser ===== */
 async function readJson(req) {
   if (req.body && typeof req.body === 'object') return req.body;
   if (req.body && typeof req.body === 'string') {
@@ -38,37 +38,73 @@ export default async function handler(req, res) {
   if (req.method !== 'POST')  return res.status(405).json({ error: 'Method not allowed' });
 
   const body = await readJson(req);
-  // Catatan:
-  // - activityId (AMBIGU): bisa process_activity_id ATAU activity_scans.id
-  // - activityScanId (spesifik): activity_scans.id
   const { documentId, activityId, activityScanId, decision } = body || {};
 
   if (!documentId && !activityId && !activityScanId) {
     return res.status(400).json({
-      error: 'documentId or activityId (process_activity_id OR scan id) or activityScanId is required'
+      error: 'documentId or activityId (process_activity_id / scan id) or activityScanId is required'
     });
   }
 
   try {
-    // Cari activity scan yang MASIH TERBUKA (end_time IS NULL)
-    // Terapkan AND ke seluruh grup; activityId diasumsikan ambigu.
-    const open = (await query(
-      `select s.*
-         from activity_scans s
-        where (
-               ($1::uuid is not null and s.document_id = $1)
-            or ($2::uuid is not null and (s.process_activity_id = $2 or s.id = $2))
-            or ($3::uuid is not null and s.id = $3)
-        )
-          and s.end_time is null
-        order by s.start_time desc
-        limit 1`,
-      [documentId || null, activityId || null, activityScanId || null]
-    ))?.[0];
+    // 1) paling presisi: activityScanId langsung
+    let open = null;
+    if (activityScanId) {
+      open = (await query(
+        `select s.*
+           from activity_scans s
+          where s.id = $1
+            and s.end_time is null
+          limit 1`,
+        [activityScanId]
+      ))?.[0];
+    }
 
-    if (!open) return res.status(404).json({ error: 'No active activity' });
+    // 2) kalau ada docId & activityId, kencangkan filter
+    if (!open && documentId && activityId) {
+      open = (await query(
+        `select s.*
+           from activity_scans s
+          where s.document_id = $1
+            and s.end_time is null
+            and (s.process_activity_id = $2 or s.id = $2)
+          order by s.start_time desc
+          limit 1`,
+        [documentId, activityId]
+      ))?.[0];
+    }
 
-    // Tutup activity scan & hitung durasi (detik)
+    // 3) fallback: docId saja (ambil open terakhir)
+    if (!open && documentId) {
+      open = (await query(
+        `select s.*
+           from activity_scans s
+          where s.document_id = $1
+            and s.end_time is null
+          order by s.start_time desc
+          limit 1`,
+        [documentId]
+      ))?.[0];
+    }
+
+    // 4) fallback: activityId saja (ambigu → cocokkan ke PA id ATAU scan id)
+    if (!open && activityId) {
+      open = (await query(
+        `select s.*
+           from activity_scans s
+          where (s.process_activity_id = $1 or s.id = $1)
+            and s.end_time is null
+          order by s.start_time desc
+          limit 1`,
+        [activityId]
+      ))?.[0];
+    }
+
+    if (!open) {
+      return res.status(404).json({ error: 'No active activity' });
+    }
+
+    // Tutup activity & hitung durasi
     const done = await query(
       `update activity_scans
           set end_time = now(),
@@ -79,9 +115,11 @@ export default async function handler(req, res) {
     );
     const docId = done?.[0]?.document_id;
 
-    // Tentukan apakah masih ada aktivitas berikutnya yang belum selesai
-    // (gunakan kolom urutan yang dipakai skema kamu: order_index)
-    const proc = (await query(`select process_id from documents where id = $1`, [docId]))?.[0];
+    // Tentukan status dokumen berikutnya
+    const proc = (await query(
+      `select process_id from documents where id = $1`,
+      [docId]
+    ))?.[0];
 
     const next = (await query(
       `select pa.id
