@@ -156,7 +156,7 @@ async function handleStart(req, res) {
       const running = await db.query(
         // Jangan gunakan kolom yang tidak ada (mis. created_at)
         // Asumsi schema punya finished_at NULL untuk yang masih berjalan.
-        'SELECT id FROM activity_scans WHERE document_id = $1 AND finished_at IS NULL LIMIT 1',
+        'SELECT id FROM activity_scans WHERE document_id = $1 AND end_time IS NULL LIMIT 1 ',
         [documentId]
       );
       if (running.rowCount > 0) {
@@ -169,7 +169,7 @@ async function handleStart(req, res) {
 
       // Catat start activity (hindari kolom timestamp kalau tidak yakin ada defaultnya)
       const ins = await db.query(
-        'INSERT INTO activity_scans (document_id, process_activity_id) VALUES ($1, $2) RETURNING id',
+        'INSERT INTO activity_scans (document_id, process_activity_id, start_time) VALUES ($1, $2, now()) RETURNING id',
         [documentId, processActivityId]
       );
 
