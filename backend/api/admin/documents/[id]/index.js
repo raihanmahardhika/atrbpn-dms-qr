@@ -1,20 +1,22 @@
-import app from "../../../../src/app.js";
-
-function setCors(res, origin) {
-  const allow = (process.env.CORS_ORIGIN || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-  if (origin && (allow.length === 0 || allow.includes(origin))) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-}
+// /backend/api/admin/documents/index.js
+import db from '../../../src/db.js';
 
 export default async function handler(req, res) {
-  setCors(res, req.headers.origin);
-  if (req.method === "OPTIONS") { res.status(204).end(); return; }
-  return app(req, res);
+  if (req.method !== 'POST') return res.status(405).end();
+
+  try {
+    const { adminId, processId, docType } = await req.json?.() || req.body;
+    const { rows: [doc] } = await db.query(
+      `INSERT INTO documents (process_id, doc_type, created_by, status)
+       VALUES ($1,$2,$3,'OPEN') RETURNING id`,
+      [processId, docType, adminId]
+    );
+
+    // url QR kamu sudah benar (deep-link ke /documents/:id)
+    const qrDownloadUrl = `/api/admin/documents/${doc.id}/qr.png`;
+    return res.status(200).json({ id: doc.id, qrDownloadUrl });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'create failed' });
+  }
 }

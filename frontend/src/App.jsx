@@ -2,39 +2,52 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './app.css';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 
-/* ============== API helpers ============== */
+/* =========================
+   API BASE + Helpers
+   ========================= */
 const API =
   import.meta.env.VITE_API_BASE_URL ||
-  'http://localhost:4000/api';
+  (typeof window !== 'undefined' && window.__API_BASE__) ||
+  'https://atrbpn-dms-qr.vercel.app/api';
 
 async function apiGet(path) {
   const r = await fetch(`${API}${path}`, { credentials: 'omit' });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || 'Request failed');
+  return d;
 }
+
 async function apiPost(path, body) {
   const r = await fetch(`${API}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'omit',
-    body: JSON.stringify(body ?? {}),
+    body: JSON.stringify(body ?? {})
   });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || 'Request failed');
   return d;
 }
 
-/* ============== UI atoms ============== */
-function Header({ title, right, onBack }) {
+/* =========================
+   UI Helpers
+   ========================= */
+function Header({ title, onBack, right }) {
   return (
     <header>
       <div className="container" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        {onBack && (
-          <button className="secondary" onClick={onBack} style={{ marginRight: 12 }}>
+        {onBack ? (
+          <button
+            className="secondary"
+            style={{ padding: '6px 10px', borderRadius: 8 }}
+            onClick={onBack}
+          >
             ← Back
           </button>
+        ) : (
+          <span />
         )}
-        <h1 style={{ margin: 0 }}>{title}</h1>
+        <h1 style={{ margin: 0, fontSize: 20 }}>{title}</h1>
         <div style={{ marginLeft: 'auto' }}>{right}</div>
       </div>
     </header>
@@ -44,28 +57,50 @@ function Header({ title, right, onBack }) {
 function Loading({ show }) {
   if (!show) return null;
   return (
-    <div className="loading-overlay">
-      <div className="spinner" />
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,.25)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 9999
+      }}
+    >
+      <div
+        style={{
+          width: 56,
+          height: 56,
+          borderRadius: '50%',
+          border: '6px solid #fff',
+          borderTopColor: 'transparent',
+          animation: 'spin 0.9s linear infinite'
+        }}
+      />
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   );
 }
 
-/* ============== QR scanner ============== */
 function QRScanner({ onScan }) {
-  const idRef = useRef(`qr-reader-${Math.random().toString(36).slice(2)}`);
-
+  const ref = useRef(null);
   useEffect(() => {
-    const scanner = new Html5QrcodeScanner(idRef.current, { fps: 10, qrbox: 300 }, false);
+    const scanner = new Html5QrcodeScanner(
+      'reader',
+      { fps: 8, qrbox: 280, rememberLastUsedCamera: true },
+      false
+    );
     scanner.render(
       (text) => {
         try {
-          onScan(text);
+          onScan?.(text);
         } catch (e) {
           console.error(e);
         }
       },
       (err) => {
-        // abaikan noise
+        // diamkan; komponen bawaan menampilkan status
       }
     );
     return () => {
@@ -74,25 +109,30 @@ function QRScanner({ onScan }) {
       } catch {}
     };
   }, [onScan]);
-
-  return <div id={idRef.current} style={{ width: '100%' }} />;
+  return <div id="reader" ref={ref} style={{ width: '100%' }} />;
 }
 
-/* ============== Main menu ============== */
+/* =========================
+   Main Menu
+   ========================= */
 function MainMenu({ goto }) {
   return (
     <div>
       <Header
-        title="ATR BPN · Document Management System Barcode"
+        title="ATR BPN · DMS Barcode"
         right={
-          <button className="secondary small" onClick={() => goto('adminSignIn')}>
+          <button
+            className="secondary"
+            style={{ padding: '6px 10px', borderRadius: 8 }}
+            onClick={() => goto('adminSignIn')}
+          >
             Sign In Admin
           </button>
         }
       />
       <div className="container">
         <div className="card center">
-          <button className="big-btn" onClick={() => goto('guest')}>
+          <button className="big-btn secondary" onClick={() => goto('guest')}>
             Scan QR
           </button>
         </div>
@@ -101,20 +141,26 @@ function MainMenu({ goto }) {
   );
 }
 
-/* ============== Admin ============== */
+/* =========================
+   Admin Sign In + Portal (ringkas)
+   ========================= */
 function AdminSignIn({ onSignedIn, onBack }) {
   const [adminId, setAdminId] = useState('');
   const [err, setErr] = useState('');
+  const [loading, setLoading] = useState(false);
 
   async function submit(e) {
     e.preventDefault();
     setErr('');
+    setLoading(true);
     try {
       const admin = await apiPost('/auth/admin/login', { adminId });
       localStorage.setItem('dms_admin', JSON.stringify(admin));
-      onSignedIn(admin);
+      onSignedIn?.(admin);
     } catch (e) {
       setErr(e.message || 'Login failed');
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -125,53 +171,21 @@ function AdminSignIn({ onSignedIn, onBack }) {
         <div className="card">
           <form onSubmit={submit}>
             <label>Admin ID</label>
-            <input value={adminId} onChange={(e) => setAdminId(e.target.value)} />
+            <input
+              value={adminId}
+              onChange={(e) => setAdminId(e.target.value)}
+              placeholder="Admin ID"
+            />
             <button type="submit">Masuk</button>
-            {err && <div className="small" style={{ color: '#b91c1c' }}>Error: {err}</div>}
+            {err && (
+              <div className="small" style={{ color: '#b91c1c' }}>
+                Error: {err}
+              </div>
+            )}
           </form>
         </div>
       </div>
-    </div>
-  );
-}
-
-function NavAdmin({ setTab }) {
-  return (
-    <div style={{ display: 'flex', gap: 8 }}>
-      <button onClick={() => setTab('create')}>Create Document</button>
-      <button className="secondary" onClick={() => setTab('reports')}>Reports</button>
-    </div>
-  );
-}
-
-function AdminApp({ admin, goto }) {
-  const [sub, setSub] = useState('create');
-  return (
-    <div>
-      <Header
-        title="Admin Portal"
-        onBack={() => goto('menu')}
-        right={
-          <div className="small">
-            Signed in as <b>{admin.name}</b> • {admin.office_type} • {admin.region}{' '}
-            <button
-              className="secondary"
-              onClick={() => {
-                localStorage.removeItem('dms_admin');
-                goto('menu');
-              }}
-            >
-              Sign Out
-            </button>
-          </div>
-        }
-      />
-      {sub === 'create' ? <AdminCreate admin={admin} /> : <Reports />}
-      <div className="container">
-        <div className="card center">
-          <NavAdmin setTab={setSub} />
-        </div>
-      </div>
+      <Loading show={loading} />
     </div>
   );
 }
@@ -186,12 +200,11 @@ function AdminCreate({ admin }) {
     (async () => {
       try {
         const data = await apiGet('/admin/processes');
-        const list = Array.isArray(data) ? data : (Array.isArray(data?.rows) ? data.rows : []);
+        const list = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
         setProcesses(list);
         if (list.length) setProcessId(list[0].id);
       } catch (e) {
         console.error(e);
-        setProcesses([]);
       }
     })();
   }, []);
@@ -200,14 +213,14 @@ function AdminCreate({ admin }) {
     e.preventDefault();
     setLoading(true);
     try {
-      const p = (Array.isArray(processes) ? processes : []).find((x) => x.id === processId);
-      const docType = p ? p.name : '';
-      const data = await apiPost('/admin/documents', {
+      const sel = processes.find((p) => p.id === processId);
+      const docType = sel ? sel.name : '';
+      const d = await apiPost('/admin/documents', {
         adminId: admin.admin_id,
         processId,
-        docType,
+        docType
       });
-      setCreated(data);
+      setCreated(d);
     } catch (e) {
       alert(e.message || 'Gagal membuat dokumen');
     } finally {
@@ -217,14 +230,10 @@ function AdminCreate({ admin }) {
 
   function printQr(url) {
     const w = window.open('', '_blank', 'noopener,noreferrer');
-    const html = `<!doctype html><html><head><meta charset='utf-8'><title>Print QR</title>
-    <style>@page{size:5cm 5cm; margin:0}html,body{height:100%;margin:0}
-    .wrap{width:5cm;height:5cm;display:flex;align-items:center;justify-content:center}
-    img{width:5cm;height:5cm}</style></head><body>
-    <div class='wrap'><img id='qr' src='${url}'/></div>
-    <script>const img=document.getElementById('qr');img.onload=()=>{window.focus();window.print();setTimeout(()=>window.close(),300)};<\/script>
-    </body></html>`;
-    w.document.open(); w.document.write(html); w.document.close();
+    const html = `<!doctype html><html><head><meta charset='utf-8'><title>Print QR</title><style>@page{size:5cm 5cm;margin:0}html,body{height:100%;margin:0}.wrap{width:5cm;height:5cm;display:flex;align-items:center;justify-content:center}img{width:5cm;height:5cm}</style></head><body><div class='wrap'><img id='qr' src='${url}'/></div><script>const img=document.getElementById('qr');img.onload=()=>{window.focus();window.print();setTimeout(()=>window.close(),300)};<\/script></body></html>`;
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
   }
 
   return (
@@ -234,9 +243,9 @@ function AdminCreate({ admin }) {
         <form onSubmit={createDoc}>
           <div className="row">
             <div>
-              <label>Proses</label>
+              <label>Layanan</label>
               <select value={processId} onChange={(e) => setProcessId(e.target.value)}>
-                {(Array.isArray(processes) ? processes : []).map((p) => (
+                {processes.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
                   </option>
@@ -255,7 +264,7 @@ function AdminCreate({ admin }) {
           <div className="small">
             ID: <code className="code">{created.id}</code>
           </div>
-          <p className="small">Print QR berikut dan tempel pada dokumen fisik.</p>
+          <p className="small">Print atau download QR berikut.</p>
           <img
             src={`${API}${created.qrDownloadUrl}`}
             alt="QR"
@@ -271,7 +280,6 @@ function AdminCreate({ admin }) {
           </div>
         </div>
       )}
-
       <Loading show={loading} />
     </div>
   );
@@ -281,34 +289,34 @@ function Reports() {
   const [summary, setSummary] = useState([]);
   const [inputId, setInputId] = useState('');
   const [detail, setDetail] = useState(null);
-  const [loading, setLoading] = useState(false);
 
   function hms(s) {
     if (s == null) return '-';
-    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    const h = Math.floor(s / 3600),
+      m = Math.floor((s % 3600) / 60),
+      sec = s % 60;
     return [h, m, sec].map((v) => String(v).padStart(2, '0')).join(':');
   }
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const d = await apiGet('/admin/reports/summary');
+        setSummary(Array.isArray(d) ? d : d?.rows || []);
+      } catch (e) {
+        console.error(e);
+      }
+    })();
+  }, []);
+
   async function fetchDetail(id) {
-    if (!id) return;
-    setLoading(true);
     try {
       const d = await apiGet(`/admin/documents/${id}`);
       setDetail(d);
     } catch (e) {
-      alert(e.message || 'Gagal mengambil detail');
-    } finally {
-      setLoading(false);
+      alert(e.message || 'Gagal ambil detail');
     }
   }
-  async function fetchSummary() {
-    try {
-      const d = await apiGet('/admin/reports/summary');
-      setSummary(Array.isArray(d) ? d : d?.rows || []);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  useEffect(() => { fetchSummary(); }, []);
 
   return (
     <div className="container">
@@ -317,7 +325,11 @@ function Reports() {
         <div className="row">
           <div>
             <label>Document ID</label>
-            <input value={inputId} onChange={(e) => setInputId(e.target.value)} placeholder="UUID dokumen" />
+            <input
+              value={inputId}
+              onChange={(e) => setInputId(e.target.value)}
+              placeholder="UUID dokumen"
+            />
           </div>
           <div>
             <label>&nbsp;</label>
@@ -332,7 +344,7 @@ function Reports() {
                 <b>{detail.document.office_type || '-'}</b> • Wilayah: {detail.document.region || '-'}
               </div>
               <div className="small">
-                Overall: <span className="badge">{hms(detail.overallSeconds)}</span> • Total Execution:{' '}
+                Overall: <span className="badge">{hms(detail.overallSeconds)}</span> • Total Exec:{' '}
                 <span className="badge">{hms(detail.totalExecutionSeconds)}</span> • Total Waiting:{' '}
                 <span className="badge">{hms(detail.totalWaitingSeconds)}</span> • Total Resting:{' '}
                 <span className="badge">{hms(detail.totalRestingSeconds)}</span>
@@ -373,7 +385,7 @@ function Reports() {
           <thead>
             <tr>
               <th>ID</th>
-              <th>Proses</th>
+              <th>Layanan</th>
               <th>Kantor</th>
               <th>Wilayah</th>
               <th>Status</th>
@@ -398,222 +410,244 @@ function Reports() {
           </tbody>
         </table>
       </div>
-
-      <Loading show={loading} />
     </div>
   );
 }
 
-/* ============== Guest (scan) ============== */
-function Guest({ goBack, initialDocumentId }) {
-  const [loading, setLoading] = useState(false);
-  const [payload, setPayload] = useState(initialDocumentId ? { documentId: initialDocumentId } : null);
-  const [state, setState] = useState(null);
-  const [acceptedFirst, setAcceptedFirst] = useState(false); // after "Terima Dokumen", before new state arrives
-
-  // ---------- helpers ----------
-  const docId = state?.document?.id || payload?.documentId || null;
-  const hasScans = (state?.scans?.length ?? 0) > 0;
-  const status = state?.state?.status;               // 'OPEN' | 'IN_PROGRESS' | 'COMPLETED' | undefined
-  const hasCurrent = !!state?.state?.current;
-  const nextName = state?.state?.next?.name || '(memuat...)';
-  const curName  = state?.state?.current?.name || state?.state?.current?.activity_name || '(memuat...)';
-
-  function setScannedId(id) {
-    setPayload({ documentId: id });
-    fetchState(id);
-  }
-
-  async function fetchState(id) {
-    if (!id) return;
-    setLoading(true);
-    try {
-      const d = await apiGet(`/scan/state/${id}`);
-      setState(d);
-    } catch (e) {
-      console.error('[fetchState]', e);
-      // Biarkan action area tetap ada – user masih bisa mencoba lagi
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  const handleScan = (text) => {
-    try {
-      const obj = JSON.parse(text);
-      if (obj?.documentId) return setScannedId(obj.documentId);
-    } catch {}
-    if (/^[0-9a-fA-F-]{36}$/.test(text)) return setScannedId(text);
-    if (typeof text === 'string') {
-      const m = text.match(/\/documents\/([0-9a-fA-F-]{36})/);
-      if (m) return setScannedId(m[1]);
-    }
-    alert('QR tidak valid');
-  };
-
-  async function startActivityFirst() {
-    // TERIMA DOKUMEN (start pertama tanpa aktivitas)
-    if (!docId) return;
-    setAcceptedFirst(true);      // tahan UI pada mode pasca-terima
-    setLoading(true);
-    try {
-      await apiPost('/scan/start', { documentId: docId, processActivityId: null });
-      await fetchState(docId);   // akan mengubah status menjadi OPEN (tanpa current) → tampil tombol Mulai
-    } catch (e) {
-      console.error('[startActivityFirst]', e);
-      alert(e.message || 'Gagal menerima dokumen');
-      setAcceptedFirst(false);   // rollback agar tombol Terima Dokumen muncul lagi
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function startActivityNext() {
-    if (!docId) return;
-    setLoading(true);
-    try {
-      const pid = state?.state?.next?.id ?? null;
-      await apiPost('/scan/start', { documentId: docId, processActivityId: pid });
-      await fetchState(docId);
-    } catch (e) {
-      console.error('[startActivityNext]', e);
-      alert(e.message || 'Gagal mulai proses');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function finishActivity(decisionArg) {
-    if (!docId) return;
-    setLoading(true);
-    try {
-      const body = state?.state?.current?.id
-        ? { activityId: state.state.current.id }
-        : { documentId: docId };
-      if (decisionArg === 'accept' || decisionArg === 'reject') body.decision = decisionArg;
-      await apiPost('/scan/finish', body);
-      await fetchState(docId);
-    } catch (e) {
-      console.error('[finishActivity]', e);
-      alert(e.message || 'Gagal menyelesaikan proses');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    if (initialDocumentId) setScannedId(initialDocumentId);
-  }, [initialDocumentId]);
-
-  // ---------- UI ----------
+function AdminApp({ admin, goto }) {
+  const [tab, setTab] = useState('create');
   return (
     <div>
-      <Header title="Scan QR" onBack={goBack} />
+      <Header
+        title="Admin Portal"
+        right={
+          <div className="small">
+            Signed in as <b>{admin.name}</b> • {admin.office_type} • {admin.region}&nbsp;
+            <button
+              className="secondary"
+              onClick={() => {
+                localStorage.removeItem('dms_admin');
+                goto('menu');
+              }}
+            >
+              Sign Out
+            </button>
+          </div>
+        }
+      />
+      {tab === 'create' ? <AdminCreate admin={admin} /> : <Reports />}
       <div className="container">
-        {/* Scanner card (tetap selalu ada di atas) */}
+        <div className="card center" style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+          <button onClick={() => setTab('create')}>Create Document</button>
+          <button className="secondary" onClick={() => setTab('reports')}>
+            Reports
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================
+   Guest (Scan) — Terima → Mulai → Selesai
+   ========================= */
+function Guest({ goBack, initialDocumentId }) {
+  const [payload, setPayload] = useState(
+    initialDocumentId ? { documentId: initialDocumentId } : null
+  );
+  const [state, setState] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [scanError, setScanError] = useState("");
+
+  // Fetch state
+  async function fetchState(docId) {
+    if (!docId) return;
+    setLoading(true);
+    try {
+      const d = await apiGet(`/scan/state/${docId}`);
+      setState(d);
+    } catch (e) {
+      console.error(e);
+      alert("Dokumen tidak ditemukan / error state");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Inisialisasi via deep-link /documents/:id atau hasil scan awal
+  useEffect(() => {
+    if (payload?.documentId) fetchState(payload.documentId);
+  }, [payload?.documentId]);
+
+  // Parser hasil scan
+  function handleScan(text) {
+    setScanError("");
+    try {
+      // deep link: https://.../documents/<uuid>
+      const m = text.match(/\/documents\/([0-9a-fA-F-]{36})/);
+      if (m) { setPayload({ documentId: m[1] }); return; }
+
+      // UUID mentah
+      if (/^[0-9a-fA-F-]{36}$/.test(text)) { setPayload({ documentId: text }); return; }
+
+      // Payload JSON lama { documentId: "..." }
+      const obj = JSON.parse(text);
+      if (obj?.documentId) { setPayload({ documentId: obj.documentId }); return; }
+
+      setScanError("QR tidak valid");
+    } catch {
+      setScanError("QR tidak valid");
+    }
+  }
+
+  // Aksi
+  async function acceptDocument() {
+    if (!state?.document?.id) return;
+    setLoading(true);
+    try {
+      await apiPost("/scan/start", { documentId: state.document.id }); // terima dokumen
+      await fetchState(state.document.id); // status -> WAITING
+    } catch (e) {
+      alert(e.message || "Gagal menerima dokumen");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function startNext() {
+    if (!state?.document?.id) return;
+    const nextId = state?.state?.next?.id;
+    if (!nextId) { alert("Tidak ada proses berikutnya."); return; }
+    setLoading(true);
+    try {
+      await apiPost("/scan/start", {
+        documentId: state.document.id,
+        processActivityId: nextId
+      }); // status -> IN_PROGRESS
+      await fetchState(state.document.id);
+    } catch (e) {
+      alert(e.message || "Gagal mulai");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function finishCurrent(decision) {
+    if (!state?.document?.id) return;
+    const body = state?.state?.current?.id
+      ? { activityId: state.state.current.id }
+      : { documentId: state.document.id };
+    if (decision) body.decision = decision;
+
+    setLoading(true);
+    try {
+      const r = await apiPost("/scan/finish", body);
+      // backend akan set status: WAITING (jika ada next) atau DONE
+      await fetchState(state.document.id);
+    } catch (e) {
+      alert(e.message || "Gagal selesai");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Derive tampilan dari status dokumen
+  const s = state?.document?.status; // 'OPEN' | 'WAITING' | 'IN_PROGRESS' | 'DONE'
+  const doc = state?.document;
+  const cur = state?.state?.current;
+  const next = state?.state?.next;
+
+  const showReception = s === "OPEN";
+  const showStart     = s === "WAITING";
+  const showWorking   = s === "IN_PROGRESS";
+  const showDone      = s === "DONE";
+
+  return (
+    <div>
+      <Header
+        title="Scan QR"
+        right={<button className="secondary" onClick={goBack}>← Back</button>}
+      />
+
+      <div className="container">
         <div className="card">
           <QRScanner onScan={handleScan} />
-          {payload && (
+          {payload?.documentId && (
             <div className="small" style={{ marginTop: 8 }}>
               Document ID: <span className="code">{payload.documentId}</span>
             </div>
           )}
+          {scanError && (
+            <div className="small" style={{ color: "#b91c1c" }}>
+              {scanError}
+            </div>
+          )}
         </div>
 
-        {/* ACTION AREA – finite state dengan fallback supaya tidak pernah "blank" */}
-
-        {/* A. Belum ada state sama sekali (baru scan) → Terima Dokumen */}
-        {payload && !state && !acceptedFirst && (
+        {doc && (
           <div className="card">
+            {/* Info dasar selalu tampil */}
             <div className="small" style={{ marginBottom: 8 }}>
-              Layanan: <b>-</b> • Kantor: <b>-</b> • Wilayah: -
+              Layanan: <b>{doc.doc_type || "-"}</b>
+              {" • "}Kantor: <b>{doc.office_type || "-"}</b>
+              {" • "}Wilayah: {doc.region || "-"}
             </div>
-            <button onClick={startActivityFirst}>Terima Dokumen</button>
-          </div>
-        )}
 
-        {/* B. Habis klik Terima, state belum balik → tampil info + (opsional) Mulai ketika sudah ada next */}
-        {acceptedFirst && !state && (
-          <div className="card">
-            <div className="small" style={{ marginBottom: 8 }}>
-              Dokumen diterima. Memuat status proses…
-            </div>
-          </div>
-        )}
-
-        {/* C. Sudah ada state */}
-        {state && (
-          <>
-            {/* C1. Pertama kali (OPEN, belum ada current, belum ada scan) → tombol Terima Dokumen */}
-            {status === 'OPEN' && !hasCurrent && !hasScans && (
-              <div className="card">
-                <div className="small" style={{ marginBottom: 8 }}>
-                  Layanan: <b>{state.document.doc_type || '-'}</b> • Kantor: <b>{state.document.office_type || '-'}</b> • Wilayah: {state.document.region || '-'}
-                </div>
-                <button onClick={startActivityFirst}>Terima Dokumen</button>
-              </div>
+            {/* C1: OPEN → Terima Dokumen */}
+            {showReception && (
+              <button onClick={acceptDocument}>Terima Dokumen</button>
             )}
 
-            {/* C2. OPEN tanpa current (setelah terima, atau antar-aktivitas) → tombol Mulai */}
-            {status === 'OPEN' && !hasCurrent && hasScans && (
-              <div className="card">
+            {/* C2: WAITING → tampilkan Proses berikutnya + Mulai */}
+            {showStart && (
+              <>
                 <div className="small" style={{ marginBottom: 8 }}>
-                  Layanan: <b>{state.document.doc_type || '-'}</b> • Kantor: <b>{state.document.office_type || '-'}</b> • Wilayah: {state.document.region || '-'}
+                  Proses berikutnya: <b>{next?.name || "-"}</b>
                 </div>
-                <div className="small" style={{ marginBottom: 8 }}>
-                  Proses berikutnya: <b>{nextName}</b>
-                </div>
-                <button onClick={startActivityNext}>Mulai</button>
-              </div>
+                <button onClick={startNext}>Mulai</button>
+              </>
             )}
 
-            {/* C3. IN_PROGRESS → tombol Selesai (atau decision) */}
-            {status === 'IN_PROGRESS' && hasCurrent && (
-              <div className="card">
+            {/* C3: IN_PROGRESS → Sedang dikerjakan + Selesai/Decision */}
+            {showWorking && (
+              <>
                 <div className="small" style={{ marginBottom: 8 }}>
-                  Layanan: <b>{state.document.doc_type || '-'}</b> • Kantor: <b>{state.document.office_type || '-'}</b> • Wilayah: {state.document.region || '-'}
+                  Sedang dikerjakan: <b>{cur?.name || cur?.activity_name || "-"}</b>
                 </div>
-                <div className="small" style={{ marginBottom: 8 }}>
-                  Sedang dikerjakan: <b>{curName}</b>
-                </div>
-
-                {state.state.current.is_decision ? (
-                  <div className="row">
-                    <div>
-                      <label>Decision</label>
-                      <div className="flex">
-                        <button onClick={() => finishActivity('accept')}>
-                          {state.state.current.decision_accept_label || 'Lanjut'}
-                        </button>
-                        <button className="secondary" onClick={() => finishActivity('reject')}>
-                          {state.state.current.decision_reject_label || 'Tolak'}
-                        </button>
-                      </div>
-                    </div>
-                    <div />
+                {cur?.is_decision ? (
+                  <div className="flex">
+                    <button onClick={() => finishCurrent("accept")}>
+                      {cur.decision_accept_label || "Lanjut"}
+                    </button>
+                    <button className="secondary" onClick={() => finishCurrent("reject")}>
+                      {cur.decision_reject_label || "Tolak"}
+                    </button>
                   </div>
                 ) : (
-                  <button className="secondary" onClick={() => finishActivity()}>Selesai</button>
+                  <button className="secondary" onClick={() => finishCurrent()}>
+                    Selesai
+                  </button>
                 )}
-              </div>
+              </>
             )}
 
-            {/* C4. COMPLETED */}
-            {status === 'COMPLETED' && (
-              <div className="card">
-                <div className="small"><b>Proses selesai.</b> Tidak ada aktivitas lanjutan.</div>
-              </div>
+            {/* C4: DONE → selesai tanpa tombol lain */}
+            {showDone && (
+              <div className="small"><b>Proses selesai.</b> Tidak ada proses lanjutan.</div>
             )}
-          </>
+          </div>
         )}
       </div>
 
+      {/* Spinner overlay (pakai komponen Loading milikmu) */}
       <Loading show={loading} />
     </div>
   );
 }
 
-/* ============== App root ============== */
+/* =========================
+   APP ROOT
+   ========================= */
 export default function App() {
   const [page, setPage] = useState('menu');
   const [deepLinkDocId, setDeepLinkDocId] = useState(null);
@@ -636,10 +670,13 @@ export default function App() {
   }, []);
 
   if (page === 'menu') return <MainMenu goto={setPage} />;
-  if (page === 'guest') return <Guest goBack={() => setPage('menu')} initialDocumentId={deepLinkDocId} />;
-  if (page === 'adminSignIn') return <AdminSignIn onSignedIn={() => setPage('admin')} onBack={() => setPage('menu')} />;
+  if (page === 'guest')
+    return <Guest goBack={() => setPage('menu')} initialDocumentId={deepLinkDocId} />;
+  if (page === 'adminSignIn')
+    return <AdminSignIn onSignedIn={() => setPage('admin')} onBack={() => setPage('menu')} />;
   if (page === 'admin') {
-    if (!admin) return <AdminSignIn onSignedIn={() => setPage('admin')} onBack={() => setPage('menu')} />;
+    if (!admin)
+      return <AdminSignIn onSignedIn={() => setPage('admin')} onBack={() => setPage('menu')} />;
     return <AdminApp admin={admin} goto={setPage} />;
   }
   return null;
