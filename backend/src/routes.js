@@ -291,7 +291,11 @@ router.post('/scan/finish', async (req,res)=>{
 
     if (setDone) {
       await query('UPDATE documents SET status=$1 WHERE id=$2', ['DONE', row.document_id]);
+    } else {
+      // belum selesai keseluruhan proses → kembali ke fase menunggu
+      await query('UPDATE documents SET status=$1 WHERE id=$2', ['WAITING', row.document_id]);
     }
+
 
     res.json({
       activityId: row.id,
