@@ -1,51 +1,23 @@
 ﻿// backend/api/scan/state/[id]/index.js
-import * as DB from '../../../../src/db.js';
+import { Pool } from 'pg';
 
-/* ---------- DB adapter -> selalu kembalikan array rows ---------- */
-function pickQuery() {
-  if (typeof DB.query === 'function') return DB.query;
-  if (DB.default && typeof DB.default.query === 'function') return DB.default.query.bind(DB.default);
-  if (DB.db && typeof DB.db.query === 'function') return DB.db.query.bind(DB.db);
-  if (DB.pool && typeof DB.pool.query === 'function') return DB.pool.query.bind(DB.pool);
-  if (typeof DB.execute === 'function') return DB.execute;
-  return null;
-}
-const rawQ = pickQuery();
-async function q(sql, params) {
-  if (!rawQ) throw new Error('DB adapter not found');
-  const r = await rawQ(sql, params);
-  // normalisasi: jadikan array rows
-  if (Array.isArray(r)) return r;
-  if (r && Array.isArray(r.rows)) return r.rows;
-  return []; // fallback
-}
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+const q = async (sql, params) => (await pool.query(sql, params)).rows;
 
-/* ---------- CORS: single origin ---------- */
-const ORIGINS = (process.env.CORS_ORIGIN || process.env.ALLOWED_ORIGINS || 'https://atrbpn-dms.web.app')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
+/** ===== CORS (single-origin) ===== */
+const RAW_ORIGINS =
+  process.env.CORS_ORIGIN || process.env.FRONTEND_URL || process.env.WEB_URL || 'https://atrbpn-dms.web.app';
+const ALLOWED = RAW_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
 function setCORS(req, res) {
-  const caller = req.headers.origin;
-  const allow = ORIGINS.includes(caller) ? caller : ORIGINS[0] || '*';
-  res.setHeader('Access-Control-Allow-Origin', allow);
+  const origin = req.headers.origin;
+  res.setHeader('Access-Control-Allow-Origin', ALLOWED.includes(origin) ? origin : ALLOWED[0]);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Max-Age', '86400');
-}
-
-/* ---------- cari nama kolom FK ke master activity ---------- */
-async function getScanActivityCol() {
-  const rows = await q(
-    `select column_name
-       from information_schema.columns
-      where table_name = 'activity_scans'
-        and column_name = any($1::text[])`,
-    [['activity_id', 'process_activity_id', 'master_activity_id']]
-  );
-  return rows[0]?.column_name || 'process_activity_id';
 }
 
 function json(res, code, payload) {
@@ -63,43 +35,41 @@ export default async function handler(req, res) {
   const id = new URL(req.url, 'http://x').pathname.split('/').pop();
 
   try {
-    const scanCol = await getScanActivityCol();
-
-    // 1) document + process name
-    const docRow = (await q(
+    // 1) dokumen + nama proses
+    const doc = (await q(
       `select d.id, d.doc_type, d.office_type, d.region, d.process_id, d.status,
               p.name as process_name
          from documents d
          left join processes p on p.id = d.process_id
         where d.id = $1`,
       [id]
-    ))[0];
-    if (!docRow) return json(res, 404, { error: 'Document not found' });
+    ))?.[0];
+    if (!doc) return json(res, 404, { error: 'Document not found' });
 
-    // 2) current activity (yang end_time is null)
-    const active = (await q(
+    // 2) current activity (yang masih open)
+    const cur = (await q(
       `select s.id as scan_id,
-              s.${scanCol} as activity_id,
+              s.process_activity_id as activity_id,
               coalesce(s.activity_name, pa.name) as name,
               pa.is_decision,
               pa.decision_accept_label,
               pa.decision_reject_label,
               s.start_time
          from activity_scans s
-         left join process_activities pa on pa.id = s.${scanCol}
+         left join process_activities pa on pa.id = s.process_activity_id
         where s.document_id = $1
           and s.end_time is null
         order by s.start_time desc
         limit 1`,
       [id]
-    ))[0] || null;
+    ))?.[0] ?? null;
 
-    // 3) next activity (yang belum completed)
+    // 3) next activity (yang belum selesai) – pakai kolom urutan kamu: order_no
     const next = (await q(
       `select pa.id, pa.name, pa.is_decision, pa.decision_accept_label, pa.decision_reject_label
          from process_activities pa
          left join activity_scans s
-           on s.${scanCol} = pa.id
+           on s.process_activity_id = pa.id
           and s.document_id = $1
           and s.end_time is not null
         where pa.process_id = $2
@@ -107,10 +77,10 @@ export default async function handler(req, res) {
         having count(s.id) = 0
         order by pa.order_no asc
         limit 1`,
-      [id, docRow.process_id]
-    ))[0] || null;
+      [id, doc.process_id]
+    ))?.[0] ?? null;
 
-    // 4) waiting seconds sejak last completed
+    // 4) waiting seconds dari aktivitas selesai terakhir
     const lastDone = (await q(
       `select end_time
          from activity_scans
@@ -119,39 +89,39 @@ export default async function handler(req, res) {
         order by end_time desc
         limit 1`,
       [id]
-    ))[0];
+    ))?.[0];
     const waitingNow = lastDone?.end_time
       ? Math.max(0, Math.floor((Date.now() - new Date(lastDone.end_time).getTime()) / 1000))
       : 0;
 
     // 5) status
-    let status = docRow.status;
+    let status = doc.status;
     if (!status) {
-      if (active) status = 'IN_PROGRESS';
+      if (cur) status = 'IN_PROGRESS';
       else if (next) status = 'WAITING';
       else status = 'DONE';
     }
 
     return json(res, 200, {
       document: {
-        id: docRow.id,
-        doc_type: docRow.doc_type,
-        office_type: docRow.office_type,
-        region: docRow.region,
-        process_id: docRow.process_id,
-        process_name: docRow.process_name,
+        id: doc.id,
+        doc_type: doc.doc_type,
+        office_type: doc.office_type,
+        region: doc.region,
+        process_id: doc.process_id,
+        process_name: doc.process_name,
         status
       },
       state: {
         status,
-        current: active
+        current: cur
           ? {
-              id: active.activity_id,
-              scan_id: active.scan_id,
-              name: active.name,
-              is_decision: !!active.is_decision,
-              decision_accept_label: active.decision_accept_label || null,
-              decision_reject_label: active.decision_reject_label || null
+              id: cur.activity_id,
+              scan_id: cur.scan_id,
+              name: cur.name,
+              is_decision: !!cur.is_decision,
+              decision_accept_label: cur.decision_accept_label || null,
+              decision_reject_label: cur.decision_reject_label || null
             }
           : null,
         next: next
@@ -168,7 +138,7 @@ export default async function handler(req, res) {
       restingNow: 0
     });
   } catch (err) {
-    console.error('scan/state error:', err);
-    return json(res, 500, { error: 'Internal error' });
+    console.error('state error', err);
+    return json(res, 500, { error: 'Internal Server Error' });
   }
 }

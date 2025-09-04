@@ -415,6 +415,15 @@ function Reports() {
   );
 }
 
+// helper di atas/sekitar komponen
+function currentActivityName(st) {
+  const c = st?.state?.current || {};
+  return (
+     c.name ?? c.activity_name ?? c.master_activity_name ?? '-'
+  );
+}
+
+
 function AdminApp({ admin, goto }) {
   const [tab, setTab] = useState('create');
   return (
@@ -627,8 +636,8 @@ function Guest({ goBack, initialDocumentId }) {
 
             {showWorking && (
                 <>
-                  <div className="small" style={{ marginBottom: 8 }}>
-                    Sedang dikerjakan: <b>{state.state.current?.name || state.state.current?.activity_name || '-'}</b>
+                  <div className="text-sm mb-2">
+                    <strong>Sedang dikerjakan:</strong> {currentActivityName(state)}
                   </div>
                   {state.state.current?.is_decision ? (
                     <div className="flex">
