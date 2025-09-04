@@ -27,13 +27,8 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   // path tanpa query (lebih aman pakai URL)
-  const path = new URL(req.url, 'http://x').pathname;
-
-  if (path === '/api/scan/finish') {
-    // delegasikan ke handler spesifik finish.js
-    return finishHandler(req, res);
-  }
-
-  // biarkan /api/scan/start ditangani oleh start.js (route spesifik)
+ const path = new URL(req.url, 'http://x').pathname;
+  if (path === '/api/scan/finish') return finishHandler(req, res);
+  // if (path === '/api/scan/start') return startHandler(req, res);
   return res.status(404).json({ error: 'Not Found' });
 }
