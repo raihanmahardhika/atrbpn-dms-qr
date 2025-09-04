@@ -392,13 +392,17 @@ router.get('/admin/reports/summary', async (req,res)=>{
       // history
       const history = (await query(
         `SELECT s.id,
-                s.process_activity_id as activity_id,
-                COALESCE(s.activity_name, pa.name) as activity_name,
-                s.start_time, s.end_time, s.duration_seconds
-           FROM activity_scans s
+                s.process_activity_id AS activity_id,
+                COALESCE(s.activity_name, pa.name) AS activity_name,
+                s.start_time,
+                s.end_time,
+                s.duration_seconds,
+                s.waiting_seconds,
+                s.resting_seconds
+            FROM activity_scans s
       LEFT JOIN process_activities pa ON pa.id = s.process_activity_id
           WHERE s.document_id = $1
-       ORDER BY s.start_time ASC`,
+      ORDER BY s.start_time ASC`,
         [documentId]
       )).rows;
 
