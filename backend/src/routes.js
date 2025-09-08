@@ -548,8 +548,7 @@ if (documentId) {
   }
 });
 
-// Hapus dokumen (hapus scan dulu untuk aman), lalu dokumen
-// POST simple (lebih mudah lolos CORS)
+// Simple request (disarankan)
 router.post('/admin/documents/:id/delete', async (req, res) => {
   const { id } = req.params;
   await query('DELETE FROM activity_scans WHERE document_id=$1', [id]);
@@ -557,7 +556,7 @@ router.post('/admin/documents/:id/delete', async (req, res) => {
   return res.json({ deleted: true, id });
 });
 
-// Fallback DELETE
+// Fallback (boleh ada)
 router.delete('/admin/documents/:id', async (req, res) => {
   const { id } = req.params;
   await query('DELETE FROM activity_scans WHERE document_id=$1', [id]);

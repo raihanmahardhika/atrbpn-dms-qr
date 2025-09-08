@@ -1,4 +1,5 @@
-﻿import app from '../../src/app.js';
+﻿// backend/api/admin/[...all].js
+import app from '../../src/app.js';
 
 const RAW =
   process.env.CORS_ORIGIN ||
@@ -10,7 +11,7 @@ function setCors(req, res) {
   const o = req.headers.origin;
   const allow = (o && ALLOWED.includes(o)) ? o : (ALLOWED[0] || '*');
 
-  // Penting: hanya SATU nilai
+  // PENTING: hanya SATU nilai ACAO
   res.setHeader('Access-Control-Allow-Origin', allow);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
