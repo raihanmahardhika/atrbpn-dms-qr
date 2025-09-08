@@ -182,29 +182,38 @@ router.post('/scan/start', async (req, res) => {
     if (dq.rowCount === 0) return res.status(404).json({ error: 'Document not found' });
     const doc = dq.rows[0];
 
-    // ==== A) TERIMA DOKUMEN ====
-    // - Ekspisit: acceptOnly === true  (klik tombol "Terima Dokumen")
-    // - Implisit: dokumen masih OPEN & belum ada activity => jadikan WAITING
-    const count = await query('SELECT COUNT(*)::int c FROM activity_scans WHERE document_id=$1', [documentId]);
-    const isFirstDoc = count.rows[0].c === 0;
+    // Hitung jumlah scan yang sudah ada
+    const count = await query(
+      'SELECT COUNT(*)::int c FROM activity_scans WHERE document_id=$1',
+      [documentId]
+    );
+    const isFirst = count.rows[0].c === 0;
 
-    if (acceptOnly === true || (isFirstDoc && doc.status === 'OPEN')) {
+    // === A) TERIMA DOKUMEN ===
+    if (acceptOnly === true || (isFirst && doc.status === 'OPEN')) {
       const nowIso = new Date().toISOString();
       await query(
-        'UPDATE documents SET accepted_at=$1, status=$2 WHERE id=$3',
-        [nowIso, 'WAITING', documentId]
+        `UPDATE documents
+            SET accepted_at = COALESCE(accepted_at, $1),
+                status      = 'WAITING'
+          WHERE id = $2`,
+        [nowIso, documentId]
       );
       return res.json({ initialized: true, status: 'WAITING', acceptedAt: nowIso });
     }
 
-    // ==== B) Mulai Activity ====
-    if (doc.status === 'DONE') return res.status(400).json({ error: 'Proses sudah selesai' });
+    // === B) MULAI ACTIVITY ===
+    if (doc.status === 'DONE') {
+      return res.status(400).json({ error: 'Proses sudah selesai' });
+    }
 
     const open = await getOpenScan(documentId);
     if (open) return res.status(400).json({ error: `Masih ada aktivitas berjalan: ${open.activity_name}` });
 
     const comp = await computeNextExpected(doc);
-    if (comp.status === 'COMPLETED') return res.status(400).json({ error: 'Proses sudah selesai' });
+    if (comp.status === 'COMPLETED') {
+      return res.status(400).json({ error: 'Proses sudah selesai' });
+    }
     const expected = comp.next ? comp.next.id : null;
 
     if (!expected && !processActivityId) {
@@ -222,30 +231,29 @@ router.post('/scan/start', async (req, res) => {
       activityName = a.rowCount ? a.rows[0].name : activityName;
     }
 
-    // === ANCHOR GAP:
-    // - Kalau sudah ada activity selesai => pakai end_time terakhir
-    // - Kalau belum ada => pakai accepted_at (bukan created_at)
-    const last = comp.last;
-    const baseAnchor = last?.end_time || doc.accepted_at || doc.created_at;
-    if (!baseAnchor) {
-      // fallback terakir—mestinya tak terjadi kalau sudah klik "Terima"
-      console.warn('[scan/start] missing anchor; using now() as accepted_at');
-      await query('UPDATE documents SET accepted_at = now() WHERE id = $1 AND accepted_at IS NULL', [documentId]);
+    // Pastikan accepted_at terisi jika status sudah WAITING (edge case)
+    if (doc.status === 'WAITING' && !doc.accepted_at) {
+      await query('UPDATE documents SET accepted_at = now() WHERE id = $1', [documentId]);
     }
 
-    const parts = splitGapWaitingResting(new Date(baseAnchor || new Date()), new Date());
-    console.log('[scan/start] anchor=', baseAnchor, ' waiting=', parts.waitingSeconds, ' resting=', parts.restingSeconds);
+    // ANCHOR jeda: last.end_time || accepted_at || created_at
+    const baseAnchor = comp.last?.end_time || doc.accepted_at || doc.created_at || new Date().toISOString();
+
+    const parts = splitGapWaitingResting(new Date(baseAnchor), new Date());
+    console.log('[scan/start] anchor=', baseAnchor,
+                ' waiting=', parts.waitingSeconds, ' resting=', parts.restingSeconds);
 
     const id = uuidv4();
     const ins = await query(
       `INSERT INTO activity_scans
-         (id, document_id, process_activity_id, activity_name, waiting_seconds, resting_seconds)
+         (id, document_id, process_activity_id, activity_name,
+          waiting_seconds, resting_seconds)
        VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING id, start_time`,
       [id, documentId, useActId, activityName, parts.waitingSeconds, parts.restingSeconds]
     );
 
-    // Status dokumen saat ada activity berjalan
+    // Saat mulai ada activity → IN_PROGRESS
     await query('UPDATE documents SET status=$1 WHERE id=$2', ['IN_PROGRESS', documentId]);
 
     res.json({
@@ -389,84 +397,84 @@ router.get('/admin/reports/summary', async (req,res)=>{
   try {
     const documentId = (req.query.documentId || '').toString().trim();
 
-    /* ---------- DETAIL MODE ---------- */
-    if (documentId) {
-      const docq = await query(`
-        SELECT d.*, p.name as process_name
-          FROM documents d
-     LEFT JOIN processes p ON p.id = d.process_id
-         WHERE d.id=$1`,
-        [documentId]
-      );
-      if (docq.rowCount === 0) return res.status(404).json({ error: 'Document not found' });
+    // ---------- DETAIL MODE ----------
+if (documentId) {
+  const docq = await query(`
+    SELECT d.*, p.name as process_name
+      FROM documents d
+ LEFT JOIN processes p ON p.id = d.process_id
+     WHERE d.id=$1`,
+    [documentId]
+  );
+  if (docq.rowCount === 0) return res.status(404).json({ error: 'Document not found' });
 
-      const doc = docq.rows[0];
-      const comp = await computeNextExpected(doc);
+  const doc  = docq.rows[0];
+  const comp = await computeNextExpected(doc);
 
-      // waiting/resting now
-      let waitingNow = 0, restingNow = 0;
-      if (state.status === 'READY') {
-        const anchor = state.last?.end_time || doc.accepted_at || doc.created_at;
-        if (anchor) {
-          const parts = splitGapWaitingResting(new Date(anchor), new Date());
-          waitingNow = parts.waitingSeconds; restingNow = parts.restingSeconds;
-        }
-      }
+  // waiting/resting now pakai anchor: last.end_time || accepted_at || created_at
+  let waitingNow = 0, restingNow = 0;
+  const anchor = comp.last?.end_time || doc.accepted_at || doc.created_at;
+  if (comp.status === 'READY' && anchor) {
+    const parts = splitGapWaitingResting(new Date(anchor), new Date());
+    waitingNow  = parts.waitingSeconds;
+    restingNow  = parts.restingSeconds;
+  }
 
-      // history
-      const history = (await query(
-        `SELECT s.id,
-                s.process_activity_id AS activity_id,
-                COALESCE(s.activity_name, pa.name) AS activity_name,
-                s.start_time,
-                s.end_time,
-                s.duration_seconds,
-                s.waiting_seconds,
-                s.resting_seconds
-            FROM activity_scans s
-      LEFT JOIN process_activities pa ON pa.id = s.process_activity_id
-          WHERE s.document_id = $1
-      ORDER BY s.start_time ASC`,
-        [documentId]
-      )).rows;
+  // history (kembalikan waiting/resting per activity juga)
+  const history = (await query(
+    `SELECT s.id,
+            s.process_activity_id as activity_id,
+            COALESCE(s.activity_name, pa.name) as activity_name,
+            s.start_time, s.end_time, s.duration_seconds,
+            s.waiting_seconds, s.resting_seconds
+       FROM activity_scans s
+  LEFT JOIN process_activities pa ON pa.id = s.process_activity_id
+      WHERE s.document_id = $1
+   ORDER BY s.start_time ASC`,
+    [documentId]
+  )).rows;
 
-      // normalize state like /scan/state
-      let status = doc.status;
-      if (!status) status = comp.status === 'IN_PROGRESS'
-        ? 'IN_PROGRESS'
-        : (comp.status === 'READY' ? 'WAITING' : (comp.status === 'COMPLETED' ? 'DONE' : doc.status));
+  // normalisasi status seperti /scan/state
+  let status = doc.status;
+  if (!status) {
+    status = comp.status === 'IN_PROGRESS'
+      ? 'IN_PROGRESS'
+      : (comp.status === 'READY'
+          ? 'WAITING'
+          : (comp.status === 'COMPLETED' ? 'DONE' : doc.status));
+  }
 
-      return res.json({
-        mode: 'detail',
-        document: { ...doc, status },
-        state: {
-          status,
-          current: comp.current
-            ? {
-                id: comp.current.process_activity_id,
-                scan_id: comp.current.id,
-                name: comp.current.activity_name || comp.current.name,
-                is_decision: !!comp.current.is_decision,
-                decision_accept_label: comp.current.decision_accept_label || null,
-                decision_reject_label: comp.current.decision_reject_label || null
-              }
-            : null,
-          next: comp.next
-            ? {
-                id: comp.next.id,
-                name: comp.next.name,
-                is_decision: !!comp.next.is_decision,
-                decision_accept_label: comp.next.decision_accept_label || null,
-                decision_reject_label: comp.next.decision_reject_label || null
-              }
-            : null
-        },
-        activities: doc.process_id ? await getActivities(doc.process_id) : [],
-        waitingNow,
-        restingNow,
-        history
-      });
-    }
+  return res.json({
+    mode: 'detail',
+    document: { ...doc, status },
+    state: {
+      status,
+      current: comp.current
+        ? {
+            id: comp.current.process_activity_id,
+            scan_id: comp.current.id,
+            name: comp.current.activity_name || comp.current.name,
+            is_decision: !!comp.current.is_decision,
+            decision_accept_label: comp.current.decision_accept_label || null,
+            decision_reject_label: comp.current.decision_reject_label || null
+          }
+        : null,
+      next: comp.next
+        ? {
+            id: comp.next.id,
+            name: comp.next.name,
+            is_decision: !!comp.next.is_decision,
+            decision_accept_label: comp.next.decision_accept_label || null,
+            decision_reject_label: comp.next.decision_reject_label || null
+          }
+        : null
+    },
+    activities: doc.process_id ? await getActivities(doc.process_id) : [],
+    waitingNow,
+    restingNow,
+    history
+  });
+}
 
     /* ---------- LIST MODE ---------- */
     const qstr   = (req.query.q || '').toString().trim().toLowerCase();
