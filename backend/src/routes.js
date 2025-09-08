@@ -516,6 +516,34 @@ router.get('/admin/reports/summary', async (req,res)=>{
   }
 });
 
+// Hapus dokumen (hapus scan dulu untuk aman), lalu dokumen
+router.delete('/admin/documents/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await query('DELETE FROM activity_scans WHERE document_id = $1', [id]);
+    const r = await query('DELETE FROM documents WHERE id = $1 RETURNING id', [id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Document not found' });
+    res.json({ deleted: true, id });
+  } catch (e) {
+    console.error('delete document error', e);
+    res.status(500).json({ error: 'Failed to delete document' });
+  }
+});
+
+// Fallback kalau FE lebih nyaman pakai POST
+router.post('/admin/documents/:id/delete', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await query('DELETE FROM activity_scans WHERE document_id = $1', [id]);
+    const r = await query('DELETE FROM documents WHERE id = $1 RETURNING id', [id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Document not found' });
+    res.json({ deleted: true, id });
+  } catch (e) {
+    console.error('delete document (POST) error', e);
+    res.status(500).json({ error: 'Failed to delete document' });
+  }
+});
+
 /* ===================== Export ======================= */
 
 export default router;
