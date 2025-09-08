@@ -173,66 +173,90 @@ router.get('/scan/state/:documentId', async (req,res)=>{
   } catch(e){ console.error(e); res.status(500).json({error:'Failed to get state'}); }
 });
 
-router.post('/scan/start', async (req,res)=>{
-  try{
-    const { documentId, processActivityId } = req.body;
-    if (!documentId) return res.status(400).json({error:'documentId is required'});
+router.post('/scan/start', async (req, res) => {
+  try {
+    const { documentId, processActivityId, acceptOnly } = req.body || {};
+    if (!documentId) return res.status(400).json({ error: 'documentId is required' });
 
-    const dq = await query('SELECT * FROM documents WHERE id=$1',[documentId]);
-    if (dq.rowCount === 0) return res.status(404).json({error:'Document not found'});
+    const dq = await query('SELECT * FROM documents WHERE id=$1', [documentId]);
+    if (dq.rowCount === 0) return res.status(404).json({ error: 'Document not found' });
     const doc = dq.rows[0];
 
-    if (doc.status === 'DONE') return res.status(400).json({error:'Proses sudah selesai'});
+    // ==== A) TERIMA DOKUMEN ====
+    // - Ekspisit: acceptOnly === true  (klik tombol "Terima Dokumen")
+    // - Implisit: dokumen masih OPEN & belum ada activity => jadikan WAITING
+    const count = await query('SELECT COUNT(*)::int c FROM activity_scans WHERE document_id=$1', [documentId]);
+    const isFirstDoc = count.rows[0].c === 0;
 
-    const count = await query('SELECT COUNT(*)::int c FROM activity_scans WHERE document_id=$1',[documentId]);
-    if (count.rows[0].c === 0) {
-      if (doc.status === 'OPEN') {
-        const nowIso = new Date().toISOString();
-        await query('UPDATE documents SET created_at=$1, status=$2 WHERE id=$3',[nowIso,'WAITING', documentId]);
-        return res.json({ initialized: true, status: 'WAITING' });
-      }
+    if (acceptOnly === true || (isFirstDoc && doc.status === 'OPEN')) {
+      const nowIso = new Date().toISOString();
+      await query(
+        'UPDATE documents SET accepted_at=$1, status=$2 WHERE id=$3',
+        [nowIso, 'WAITING', documentId]
+      );
+      return res.json({ initialized: true, status: 'WAITING', acceptedAt: nowIso });
     }
 
+    // ==== B) Mulai Activity ====
+    if (doc.status === 'DONE') return res.status(400).json({ error: 'Proses sudah selesai' });
+
     const open = await getOpenScan(documentId);
-    if (open) return res.status(400).json({error:`Masih ada aktivitas berjalan: ${open.activity_name}`});
+    if (open) return res.status(400).json({ error: `Masih ada aktivitas berjalan: ${open.activity_name}` });
 
     const comp = await computeNextExpected(doc);
-    if (comp.status === 'COMPLETED') return res.status(400).json({error:'Proses sudah selesai'});
+    if (comp.status === 'COMPLETED') return res.status(400).json({ error: 'Proses sudah selesai' });
     const expected = comp.next ? comp.next.id : null;
 
     if (!expected && !processActivityId) {
-      return res.status(400).json({error:'Tidak ada aktivitas berikutnya'});
+      return res.status(400).json({ error: 'Tidak ada aktivitas berikutnya' });
     }
     if (doc.process_id && expected && processActivityId && processActivityId !== expected) {
-      return res.status(400).json({error:'Aktivitas tidak sesuai urutan proses'});
+      return res.status(400).json({ error: 'Aktivitas tidak sesuai urutan proses' });
     }
 
     const useActId = processActivityId || expected;
 
     let activityName = 'Aktivitas';
     if (useActId) {
-      const a = await query('SELECT name FROM process_activities WHERE id=$1',[useActId]);
+      const a = await query('SELECT name FROM process_activities WHERE id=$1', [useActId]);
       activityName = a.rowCount ? a.rows[0].name : activityName;
     }
 
+    // === ANCHOR GAP:
+    // - Kalau sudah ada activity selesai => pakai end_time terakhir
+    // - Kalau belum ada => pakai accepted_at (bukan created_at)
     const last = comp.last;
-    const lastEnd = last?.end_time || doc.created_at;
-    const parts = splitGapWaitingResting(new Date(lastEnd), new Date());
+    const baseAnchor = last?.end_time || doc.accepted_at || doc.created_at;
+    if (!baseAnchor) {
+      // fallback terakir—mestinya tak terjadi kalau sudah klik "Terima"
+      console.warn('[scan/start] missing anchor; using now() as accepted_at');
+      await query('UPDATE documents SET accepted_at = now() WHERE id = $1 AND accepted_at IS NULL', [documentId]);
+    }
+
+    const parts = splitGapWaitingResting(new Date(baseAnchor || new Date()), new Date());
+    console.log('[scan/start] anchor=', baseAnchor, ' waiting=', parts.waitingSeconds, ' resting=', parts.restingSeconds);
 
     const id = uuidv4();
     const ins = await query(
-      'INSERT INTO activity_scans (id,document_id,process_activity_id,activity_name,waiting_seconds,resting_seconds) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,start_time',
+      `INSERT INTO activity_scans
+         (id, document_id, process_activity_id, activity_name, waiting_seconds, resting_seconds)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, start_time`,
       [id, documentId, useActId, activityName, parts.waitingSeconds, parts.restingSeconds]
     );
+
+    // Status dokumen saat ada activity berjalan
+    await query('UPDATE documents SET status=$1 WHERE id=$2', ['IN_PROGRESS', documentId]);
+
     res.json({
       activityId: ins.rows[0].id,
       startTime: ins.rows[0].start_time,
       waitingSeconds: parts.waitingSeconds,
       restingSeconds: parts.restingSeconds
     });
-  } catch(e){
+  } catch (e) {
     console.error(e);
-    res.status(500).json({error:'Failed to start activity'});
+    res.status(500).json({ error: 'Failed to start activity' });
   }
 });
 
@@ -381,10 +405,10 @@ router.get('/admin/reports/summary', async (req,res)=>{
 
       // waiting/resting now
       let waitingNow = 0, restingNow = 0;
-      if (comp.status === 'READY') {
-        const base = comp.last?.end_time || doc.created_at;
-        if (base) {
-          const parts = splitGapWaitingResting(new Date(base), new Date());
+      if (state.status === 'READY') {
+        const anchor = state.last?.end_time || doc.accepted_at || doc.created_at;
+        if (anchor) {
+          const parts = splitGapWaitingResting(new Date(anchor), new Date());
           waitingNow = parts.waitingSeconds; restingNow = parts.restingSeconds;
         }
       }
