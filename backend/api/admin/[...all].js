@@ -1,6 +1,7 @@
 ﻿// backend/api/admin/[...all].js
 import app from '../../src/app.js';
 
+// whitelist origin
 const RAW =
   process.env.CORS_ORIGIN ||
   'https://atrbpn-dms.web.app,https://atrbpn-dms.firebaseapp.com,http://localhost:5173';
@@ -8,9 +9,11 @@ const RAW =
 const ALLOWED = RAW.split(',').map(s => s.trim()).filter(Boolean);
 
 function setCors(req, res) {
-  const origin = req.headers.origin;
-  const allow = origin && ALLOWED.includes(origin) ? origin : (ALLOWED[0] || '*');
-  res.setHeader('Access-Control-Allow-Origin', allow);     // <- SATU nilai saja
+  const o = req.headers.origin;
+  const allow = (o && ALLOWED.includes(o)) ? o : (ALLOWED[0] || '*');
+
+  // PENTING: hanya SATU nilai ACAO
+  res.setHeader('Access-Control-Allow-Origin', allow);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -20,12 +23,12 @@ function setCors(req, res) {
 export default function handler(req, res) {
   setCors(req, res);
 
-  // Preflight harus diakhiri di sini agar selalu ada header CORS
+  // preflight short-circuit untuk SEMUA path /api/admin/**
   if ((req.method || '').toUpperCase() === 'OPTIONS') {
     res.statusCode = 204;
     return res.end();
   }
 
-  // teruskan ke Express (yang juga punya CORS—tidak masalah)
+  // teruskan ke Express app (routes.js)
   return app(req, res);
 }
