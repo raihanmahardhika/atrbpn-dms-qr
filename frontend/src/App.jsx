@@ -288,8 +288,25 @@ function AdminCreate({ admin }) {
 
 function Reports() {
   const [summary, setSummary] = useState([]);
-  const [inputId, setInputId] = useState('');
-  const [detail, setDetail] = useState(null);
+  const [expandedId, setExpandedId] = useState(null);
+  const [details, setDetails] = useState({});     // { [docId]: detailObj }
+  const [loadingDetail, setLoadingDetail] = useState(null);
+  const [loadingList, setLoadingList] = useState(false);
+
+  // spinner CSS kecil (inline)
+  const spinnerCss = `
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .mini-spinner{
+      display:inline-block;
+      width:14px;height:14px;
+      border:2px solid #e5e7eb;           /* abu-abu muda */
+      border-top-color:#0ea5e9;           /* biru kecil */
+      border-radius:50%;
+      animation:spin .6s linear infinite;
+      vertical-align:middle;
+      margin-left:8px;
+    }
+  `;
 
   function hms(s) {
     if (s == null) return '-';
@@ -299,90 +316,96 @@ function Reports() {
     return [h, m, sec].map((v) => String(v).padStart(2, '0')).join(':');
   }
 
+  // Load list (ringkasan) dengan jeda minimal supaya spinner terlihat
   useEffect(() => {
     (async () => {
+      setLoadingList(true);
+      const MIN_LOAD_MS = 600; // jeda minimal 600ms
+      const t0 = Date.now();
       try {
         const d = await apiGet('/admin/reports/summary');
-        setSummary(Array.isArray(d) ? d : d?.rows || []);
+        const rows = Array.isArray(d) ? d : d?.items || d?.rows || [];
+        const elapsed = Date.now() - t0;
+        if (elapsed < MIN_LOAD_MS) {
+          await new Promise((r) => setTimeout(r, MIN_LOAD_MS - elapsed));
+        }
+        setSummary(rows);
       } catch (e) {
         console.error(e);
+      } finally {
+        setLoadingList(false);
       }
     })();
   }, []);
 
-  async function fetchDetail(id) {
+  // Ambil detail saat expand
+  async function fetchDetail(docId) {
+    if (details[docId]) return;
+    setLoadingDetail(docId);
     try {
-      const d = await apiGet(`/admin/documents/${id}`);
-      setDetail(d);
+      const d = await apiGet(`/admin/reports/summary?documentId=${docId}`);
+      setDetails((prev) => ({ ...prev, [docId]: d }));
     } catch (e) {
       alert(e.message || 'Gagal ambil detail');
+    } finally {
+      setLoadingDetail(null);
     }
+  }
+
+    function viewQr(id) {
+    // domain QR sesuai permintaanmu
+    const url = `https://atrbpn-dms-qr.vercel.app/api/admin/documents/${id}/qr.png`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }
+
+ async function deleteDoc(id) {
+  if (!id) return;
+  if (!confirm('Hapus dokumen ini beserta riwayat aktivitasnya?')) return;
+
+  const resp = await fetch(`${API}/admin/documents/${id}/delete`, {
+    method: 'POST',
+    mode: 'cors',
+    credentials: 'omit',
+    cache: 'no-store',
+  });
+
+  const data = (resp.headers.get('content-type')||'').includes('application/json')
+    ? await resp.json().catch(() => null)
+    : null;
+
+  if (!resp.ok || !data?.deleted) throw new Error(data?.error || `Delete gagal (HTTP ${resp.status})`);
+
+  // update UI lokal
+  setSummary(prev => prev.filter(x => x.id !== id));
+  if (typeof setDetails === 'function') setDetails(p => { const n = { ...p }; delete n[id]; return n; });
+  if (typeof setExpandedId === 'function') setExpandedId(cur => (cur === id ? null : cur));
+  if (typeof setDetail === 'function') setDetail(null);
+
+  alert('Dokumen berhasil dihapus.');
+}
+
+  function toggleExpand(docId) {
+    const next = expandedId === docId ? null : docId;
+    setExpandedId(next);
+    if (next && !details[next]) fetchDetail(next);
   }
 
   return (
     <div className="container">
-      <div className="card">
-        <h2>Detail Dokumen</h2>
-        <div className="row">
-          <div>
-            <label>Document ID</label>
-            <input
-              value={inputId}
-              onChange={(e) => setInputId(e.target.value)}
-              placeholder="UUID dokumen"
-            />
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <button onClick={() => fetchDetail(inputId)}>Lihat Detail</button>
-          </div>
-        </div>
-        {detail && (
-          <div style={{ marginTop: 12 }}>
-            <div style={{ marginBottom: 8 }}>
-              <div>
-                <b>{detail.document.process_name || detail.document.doc_type || '-'}</b> • Kantor:{' '}
-                <b>{detail.document.office_type || '-'}</b> • Wilayah: {detail.document.region || '-'}
-              </div>
-              <div className="small">
-                Overall: <span className="badge">{hms(detail.overallSeconds)}</span> • Total Exec:{' '}
-                <span className="badge">{hms(detail.totalExecutionSeconds)}</span> • Total Waiting:{' '}
-                <span className="badge">{hms(detail.totalWaitingSeconds)}</span> • Total Resting:{' '}
-                <span className="badge">{hms(detail.totalRestingSeconds)}</span>
-              </div>
-            </div>
-            <h4>Log Aktivitas</h4>
-            <table>
-              <thead>
-                <tr>
-                  <th>Start</th>
-                  <th>End</th>
-                  <th>Durasi</th>
-                  <th>Waiting</th>
-                  <th>Resting</th>
-                  <th>Aktivitas</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(detail.scans || []).map((s) => (
-                  <tr key={s.id}>
-                    <td>{new Date(s.start_time).toLocaleString()}</td>
-                    <td>{s.end_time ? new Date(s.end_time).toLocaleString() : '-'}</td>
-                    <td>{s.duration_seconds ? s.duration_seconds + ' dtk' : '-'}</td>
-                    <td>{s.waiting_seconds || 0} dtk</td>
-                    <td>{s.resting_seconds || 0} dtk</td>
-                    <td>{s.master_activity_name || s.activity_name}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+      <style>{spinnerCss}</style>
 
       <div className="card">
-        <h2>Ringkasan Terbaru</h2>
-        <table>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+          <h2 style={{ margin:0 }}>Ringkasan Terbaru</h2>
+          {/* spinner kecil di dalam kotak saat list loading */}
+          {loadingList && <span className="mini-spinner" aria-label="loading" />}
+        </div>
+
+        <div className="small" style={{ margin: '8px 0', color: '#64748b' }}>
+          Klik baris untuk melihat detail dokumen (pushdown).
+        </div>
+
+        <table style={{ opacity: loadingList ? 0.85 : 1 }}>
           <thead>
             <tr>
               <th>ID</th>
@@ -396,18 +419,110 @@ function Reports() {
             </tr>
           </thead>
           <tbody>
-            {(Array.isArray(summary) ? summary : []).map((r) => (
-              <tr key={r.id}>
-                <td className="code">{r.id?.slice(0, 8) || '-'}…</td>
-                <td>{r.process_name || r.doc_type}</td>
-                <td>{r.office_type || '-'}</td>
-                <td>{r.region || '-'}</td>
-                <td>{r.status}</td>
-                <td>{Math.round((r.total_activity_seconds || 0) / 60)} m</td>
-                <td>{Math.round((r.total_waiting_seconds || 0) / 60)} m</td>
-                <td>{Math.round((r.total_resting_seconds || 0) / 60)} m</td>
-              </tr>
-            ))}
+            {(Array.isArray(summary) ? summary : []).map((r) => {
+              const isOpen = expandedId === r.id;
+              const det = details[r.id];
+
+              return (
+                <React.Fragment key={r.id}>
+                  <tr
+                    onClick={() => toggleExpand(r.id)}
+                    style={{ cursor: 'pointer' }}
+                    title="Klik untuk melihat detail"
+                  >
+                    <td className="code">{r.id?.slice(0, 8) || '-'}…</td>
+                    <td>{r.process_name || r.doc_type}</td>
+                    <td>{r.office_type || '-'}</td>
+                    <td>{r.region || '-'}</td>
+                    <td>{r.status}</td>
+                    <td>{Math.round((r.total_activity_seconds || 0) / 60)} m</td>
+                    <td>{Math.round((r.total_waiting_seconds || 0) / 60)} m</td>
+                    <td>{Math.round((r.total_resting_seconds || 0) / 60)} m</td>
+                  </tr>
+
+                  {isOpen && (
+                    <tr>
+                      <td colSpan={8} style={{ background: '#f8fafc' }}>
+                        {loadingDetail === r.id && !det ? (
+                          <div className="small" style={{ padding: 12 }}>
+                            Memuat detail <span className="mini-spinner" />
+                          </div>
+                        ) : det ? (
+                          <div style={{ padding: 12 }}>
+                            <div style={{ marginBottom: 8 }}>
+                                <div style={{ margin: '8px 0', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); viewQr(r.id); }}
+                                  className="btn btn-secondary"
+                                  title="Lihat QR"
+                                >
+                                  View QR
+                                </button>
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); deleteDoc(r.id); }}
+                                  className="btn btn-danger"
+                                  title="Hapus dokumen"
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                              <div>
+                                <b>{det.document?.process_name || det.document?.doc_type || '-'}</b>
+                                {' • '}Kantor: <b>{det.document?.office_type || '-'}</b>
+                                {' • '}Wilayah: <b>{det.document?.region || '-'}</b>
+                                {' • '}Status:{' '}
+                                <span className="badge">{det.document?.status || '-'}</span>
+                              </div>
+                              <div className="small" style={{ marginTop: 4 }}>
+                                Sedang dikerjakan: <b>{det.state?.current?.name || '-'}</b>
+                              </div>
+                              <div className="small">
+                                Proses berikutnya: <b>{det.state?.next?.name || '-'}</b>
+                              </div>
+                            </div>
+
+                            <h4 style={{ margin: '8px 0' }}>Log Aktivitas</h4>
+                            <table>
+                              <thead>
+                                <tr>
+                                  <th>Start</th>
+                                  <th>End</th>
+                                  <th>Durasi</th>
+                                  <th>Waiting</th>
+                                  <th>Resting</th>
+                                  <th>Aktivitas</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {(det.history || []).map((s) => (
+                                  <tr key={s.id}>
+                                    <td>{s.start_time ? new Date(s.start_time).toLocaleString() : '-'}</td>
+                                    <td>{s.end_time ? new Date(s.end_time).toLocaleString() : '-'}</td>
+                                    <td>{s.duration_seconds != null ? `${s.duration_seconds} dtk` : '-'}</td>
+                                    <td>{s.waiting_seconds || 0} dtk</td>
+                                    <td>{s.resting_seconds || 0} dtk</td>
+                                    <td>{s.activity_name || '-'}</td>
+                                  </tr>
+                                ))}
+                                {(det.history || []).length === 0 && (
+                                  <tr>
+                                    <td colSpan={6} className="small">Belum ada riwayat.</td>
+                                  </tr>
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <div className="small" style={{ padding: 12, color: '#ef4444' }}>
+                            Gagal memuat detail.
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -636,8 +751,8 @@ function Guest({ goBack, initialDocumentId }) {
 
             {showWorking && (
                 <>
-                  <div className="text-sm mb-2">
-                    <strong>Sedang dikerjakan:</strong> {currentActivityName(state)}
+                  <div className="small">
+                    Sedang dikerjakan: <b>{currentActivityName(state)}</b>
                   </div>
                   {state.state.current?.is_decision ? (
                     <div className="flex">
