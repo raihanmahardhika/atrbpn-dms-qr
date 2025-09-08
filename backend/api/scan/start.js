@@ -1,40 +1,36 @@
 ﻿// backend/api/scan/start.js
-// Runtime: Node.js 22 (ESM)
-// npm i pg
+// Node.js 22 ESM on Vercel
 import { Pool } from 'pg';
-import { randomUUID } from 'crypto';
+import { randomUUID as uuid } from 'crypto';
 import { splitGapWaitingResting } from '../../src/utils.js';
 
-/** ========= DB (Neon) ========= **/
+/** ===== DB ===== */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+const q = async (sql, params) => (await pool.query(sql, params)).rows;
 
-/** ========= CORS ========= **/
-const RAW_ORIGINS =
-  process.env.CORS_ORIGIN ||
-  process.env.FRONTEND_URL ||
-  process.env.WEB_URL ||
-  // fallback allow-list (urut penting: pertama jadi default jika origin tak cocok)
-  'https://atrbpn-dms.web.app,https://atrbpn-dms.firebaseapp.com,http://localhost:5173';
+/** ===== CORS (single-origin) ===== */
+const ORIGINS =
+  (process.env.CORS_ORIGIN ||
+    'https://atrbpn-dms.web.app,https://atrbpn-dms.firebaseapp.com,http://localhost:5173')
+    .split(',').map(s => s.trim()).filter(Boolean);
 
-const ALLOWED = RAW_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
-
-function setCORS(req, res) {
+function setCors(req, res) {
   const origin = req.headers.origin;
-  const allow = origin && ALLOWED.includes(origin) ? origin : (ALLOWED[0] || '*');
-  res.setHeader('Access-Control-Allow-Origin', allow); // PENTING: hanya satu nilai
+  const allow = origin && ORIGINS.includes(origin) ? origin : (ORIGINS[0] || '*');
+  res.setHeader('Access-Control-Allow-Origin', allow); // SATU nilai
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-/** ========= Utils ========= **/
+/** ===== Body parser fallback ===== */
 async function readJson(req) {
   if (req.body && typeof req.body === 'object') return req.body;
-  if (typeof req.body === 'string') {
+  if (req.body && typeof req.body === 'string') {
     try { return JSON.parse(req.body); } catch {}
   }
   const chunks = [];
@@ -43,165 +39,119 @@ async function readJson(req) {
   try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
 }
 
+/** ===== Helpers ===== */
 function json(res, code, payload) {
   res.statusCode = code;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.end(JSON.stringify(payload));
 }
 
-async function runTx(fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const out = await fn(client);
-    await client.query('COMMIT');
-    return out;
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch {}
-    throw e;
-  } finally {
-    client.release();
-  }
-}
+/** ===== Handler ===== */
+export default async function handler(req, res) {
+  setCors(req, res);
 
-/** ========= Handler /api/scan/start ========= **/
-async function handleStart(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return json(res, 405, { error: 'Method Not Allowed' });
 
-  const body = await readJson(req);
-  const { acceptOnly, documentId, processActivityId } = body || {};
-
-  if (!documentId) return json(res, 400, { error: 'documentId missing' });
-
   try {
-    // ============ MODE: TERIMA DOKUMEN ============
-    if (acceptOnly === true) {
-      const result = await runTx(async (db) => {
-        const dq = await db.query(
-          'SELECT id, status, created_at FROM documents WHERE id = $1',
-          [documentId]
-        );
-        if (dq.rowCount === 0) return { ok: false, code: 404, error: 'Document not found' };
+    const body = await readJson(req);
+    const { documentId, processActivityId, acceptOnly } = body || {};
+    if (!documentId) return json(res, 400, { error: 'documentId is required' });
 
-        const cur = dq.rows[0];
-        // izinkan dari OPEN atau WAITING; tolak selain itu
-        if (cur.status !== 'OPEN' && cur.status !== 'WAITING') {
-          return {
-            ok: false, code: 409,
-            error: 'Invalid state to accept',
-            currentStatus: cur.status,
-          };
-        }
+    // Dokumen
+    const doc = (await q('select * from documents where id = $1', [documentId]))?.[0];
+    if (!doc) return json(res, 404, { error: 'Document not found' });
 
-        const upd = await db.query(
-          `UPDATE documents
-              SET status = 'WAITING',
-                  created_at = COALESCE(created_at, now())
-            WHERE id = $1
-        RETURNING id, status, created_at`,
-          [documentId]
-        );
-
-        return { ok: true, document: upd.rows[0] };
-      });
-
-      if (!result.ok) return json(res, result.code, result);
-      return json(res, 200, { ok: true, ...result });
+    // Cek ada scan berjalan?
+    const open = (await q(
+      `select s.id, s.process_activity_id, coalesce(s.activity_name, pa.name) as activity_name
+         from activity_scans s
+         left join process_activities pa on pa.id = s.process_activity_id
+        where s.document_id = $1 and s.end_time is null
+        limit 1`, [documentId]
+    ))?.[0];
+    if (open && acceptOnly !== true) {
+      return json(res, 409, { error: `An activity is already in progress: ${open.activity_name}` });
     }
 
-    // ============ MODE: MULAI AKTIVITAS ============
-    if (!processActivityId) return json(res, 400, { error: 'processActivityId missing' });
+    // Hitung jumlah scan
+    const firstCount = (await q(
+      'select count(*)::int as c from activity_scans where document_id=$1', [documentId]
+    ))?.[0]?.c ?? 0;
+    const isFirst = firstCount === 0;
 
-    const result = await runTx(async (db) => {
-      // Dokumen harus WAITING dan memiliki process_id
-      const dq = await db.query(
-        'SELECT id, status, process_id, created_at FROM documents WHERE id = $1',
-        [documentId]
+    /** ===== A) Terima Dokumen ===== */
+    if (acceptOnly === true || (isFirst && doc.status === 'OPEN')) {
+      const nowIso = new Date().toISOString();
+      await q(
+        `update documents
+            set accepted_at = coalesce(accepted_at, $1),
+                status      = 'WAITING'
+          where id = $2`,
+        [nowIso, documentId]
       );
-      if (dq.rowCount === 0) return { ok: false, code: 404, error: 'Document not found' };
+      return json(res, 200, { initialized: true, status: 'WAITING', acceptedAt: nowIso });
+    }
 
-      const doc = dq.rows[0];
-      if (doc.status !== 'WAITING') {
-        return {
-          ok: false, code: 409,
-          error: 'Document must be in WAITING to start next activity',
-          currentStatus: doc.status,
-        };
+    /** ===== B) Mulai Activity ===== */
+    if (doc.status === 'DONE') return json(res, 400, { error: 'Process already DONE' });
+    if (open) return json(res, 409, { error: `An activity is already in progress: ${open.activity_name}` });
+
+    // Validasi processActivityId (harus milik proses dokumen)
+    if (processActivityId) {
+      const pa = (await q('select id, process_id, name from process_activities where id=$1', [processActivityId]))?.[0];
+      if (!pa) return json(res, 400, { error: 'Invalid processActivityId' });
+      if (doc.process_id && pa.process_id !== doc.process_id) {
+        return json(res, 400, { error: 'processActivity does not belong to the document process' });
       }
+    }
 
-      // Validasi activity milik process yang sama + ambil nama
-      const pa = await db.query(
-        'SELECT id, process_id, name FROM process_activities WHERE id = $1',
-        [processActivityId]
-      );
-      if (pa.rowCount === 0) return { ok: false, code: 400, error: 'Invalid processActivityId' };
-      if (pa.rows[0].process_id !== doc.process_id) {
-        return { ok: false, code: 400, error: 'processActivity does not belong to the document process' };
-      }
-      const activityName = pa.rows[0].name || 'Aktivitas';
+    // Ambil last completed untuk anchor
+    const last = (await q(
+      `select end_time
+         from activity_scans
+        where document_id = $1 and end_time is not null
+        order by end_time desc
+        limit 1`,
+      [documentId]
+    ))?.[0];
 
-      // Pastikan tidak ada activity yang sedang berjalan
-      const running = await db.query(
-        'SELECT id FROM activity_scans WHERE document_id = $1 AND end_time IS NULL LIMIT 1',
-        [documentId]
-      );
-      if (running.rowCount > 0) {
-        return { ok: false, code: 409, error: 'An activity is already in progress for this document' };
-      }
+    // ANCHOR: last.end_time || accepted_at || created_at || now()
+    const baseAnchor = last?.end_time || doc.accepted_at || doc.created_at || new Date().toISOString();
 
-      // Ambil end_time terakhir yang selesai (kalau ada)
-      const lastDone = await db.query(
-        `SELECT end_time
-           FROM activity_scans
-          WHERE document_id = $1
-            AND end_time IS NOT NULL
-       ORDER BY end_time DESC
-          LIMIT 1`,
-        [documentId]
-      );
-      const baseStart = lastDone.rowCount ? lastDone.rows[0].end_time : (doc.created_at || new Date().toISOString());
+    // Hitung waiting/resting berbasis WIB
+    const parts = splitGapWaitingResting(new Date(baseAnchor), new Date());
+    console.log('[scan/start] anchor=', baseAnchor,
+                ' waiting=', parts.waitingSeconds, ' resting=', parts.restingSeconds);
 
-      // Hitung waiting/resting WIB (weekday 08-17)
-      const parts = splitGapWaitingResting(new Date(baseStart), new Date());
-      console.log('[scan/start] gap parts =', { baseStart, waiting: parts.waitingSeconds, resting: parts.restingSeconds });
+    // Nama aktivitas (opsional)
+    let activityName = 'Aktivitas';
+    if (processActivityId) {
+      const paName = (await q('select name from process_activities where id=$1', [processActivityId]))?.[0]?.name;
+      if (paName) activityName = paName;
+    }
 
-      // Insert activity scan + set IN_PROGRESS
-      const newId = randomUUID();
-      const ins = await db.query(
-        `INSERT INTO activity_scans
-           (id, document_id, process_activity_id, activity_name,
-            waiting_seconds, resting_seconds, start_time)
-         VALUES ($1, $2, $3, $4, $5, $6, now())
-         RETURNING id, start_time`,
-        [newId, documentId, processActivityId, activityName, parts.waitingSeconds, parts.restingSeconds]
-      );
+    // Insert scan
+    const newId = uuid();
+    const ins = await q(
+      `insert into activity_scans
+         (id, document_id, process_activity_id, activity_name, waiting_seconds, resting_seconds)
+       values ($1,$2,$3,$4,$5,$6)
+       returning id, start_time`,
+      [newId, documentId, processActivityId || null, activityName, parts.waitingSeconds, parts.restingSeconds]
+    );
 
-      await db.query(
-        "UPDATE documents SET status = 'IN_PROGRESS' WHERE id = $1",
-        [documentId]
-      );
+    // Update status dokumen
+    await q('update documents set status = $2 where id = $1', [documentId, 'IN_PROGRESS']);
 
-      return {
-        ok: true,
-        activityScanId: ins.rows[0].id,
-        startTime: ins.rows[0].start_time,
-        waitingSeconds: parts.waitingSeconds,
-        restingSeconds: parts.restingSeconds,
-        newStatus: 'IN_PROGRESS',
-      };
+    return json(res, 200, {
+      activityId: ins[0].id,
+      startTime: ins[0].start_time,
+      waitingSeconds: parts.waitingSeconds,
+      restingSeconds: parts.restingSeconds
     });
-
-    if (!result.ok) return json(res, result.code, result);
-    return json(res, 200, { ok: true, ...result });
-  } catch (err) {
-    console.error('start error', err);
+  } catch (e) {
+    console.error('scan/start error', e);
     return json(res, 500, { error: 'Internal Server Error' });
   }
-}
-
-/** ========= Main export ========= **/
-export default async function handler(req, res) {
-  setCORS(req, res);
-  return handleStart(req, res);
 }
